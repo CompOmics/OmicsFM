@@ -1,0 +1,55 @@
+# ── Large data & model artifacts (never commit) ─────────────────────────
+# Proteomics / transcriptomics datasets, caches, and derived files
+data/
+fasta/
+model/
+transcriptomics/output/
+transcriptomics/split/
+transcriptomics/*.parquet
+
+# Generic data/checkpoint extensions, anywhere in the tree
+*.parquet
+*.npz
+*.npy
+*.ckpt
+*.pt
+*.pth
+*.h5
+*.h5ad
+*.hdf5
+*.fasta
+*.fa
+*.tsv
+
+# ── Experiment tracking / logs ──────────────────────────────────────────
+wandb/
+*.log
+
+# ── Python ──────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# ── Editor / OS ─────────────────────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ── Scratch ─────────────────────────────────────────────────────────────
+_inspect_*.py
+_scratch*
+*.tmp

@@ -1,0 +1,61 @@
+# Transcriptomics Pipeline Configuration
+
+census_version: "stable" # pins which snapshot of CELLxGene database to querry
+output_dir: transcriptomics/output
+
+# Protein set + order is extracted from this file's columns (UniProt accessions)
+proteomics_reference: data/split_v2/train.parquet
+
+gene_protein_map:
+  cache_path: transcriptomics/gene_protein_map.parquet
+  force_rebuild: false
+
+# CELLxGENE tissue_general values to fetch
+tissues:
+  - blood
+  - brain
+  - lung
+  - liver
+  - kidney
+  - heart
+  - small intestine
+  - large intestine
+  - colon
+  - skin of body
+  - pancreas
+  - bone marrow
+  - eye
+  - breast
+  - prostate gland
+  - stomach
+  - spleen
+  - adipose tissue
+  - musculature
+  - lymph node
+  - ovary
+  - uterus
+  - testis
+  - bladder organ
+  - esophagus
+  - placenta
+  - endocrine gland
+
+cells_per_tissue: 200000
+sampling_strategy: diversity   # "diversity" (inverse cell-type freq) or "random"
+dtype: uint8                   # uint8, uint16, float16, float32
+compress_output: false         # compressed npz is ~6x smaller but ~30min slower to save
+seed: 42
+workers: 8                     # parallel tissue fetching (each opens its own Census connection)
+
+# Cell quality filters
+qc:
+  min_genes_per_cell: 200      # remove empty droplets / debris
+  min_umi_per_cell: 500        # remove low-depth cells
+  max_mito_fraction: 0.20      # remove dying/damaged cells
+
+# Train/valid/test split (used by split_dataset.py)
+split:
+  output_dir: transcriptomics/split
+  train_frac: 0.90
+  valid_frac: 0.05
+  test_frac: 0.05

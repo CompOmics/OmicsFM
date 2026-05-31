@@ -1,0 +1,73 @@
+# ProtGPT Configuration
+data:
+  modality: "proteomics"       # "proteomics" or "transcriptomics"
+
+  # Proteomics (parquet-based)
+  proteomics:
+    train_path: data/nsaf_diann/quant_train.parquet
+    valid_path: data/nsaf_diann/quant_valid.parquet
+    test_path: data/nsaf_diann/quant_test.parquet
+
+  # Transcriptomics (split sparse matrices from split_dataset.py)
+  transcriptomics:
+    train_path: transcriptomics/split/train.npz
+    valid_path: transcriptomics/split/val.npz
+    test_path: transcriptomics/split/test.npz
+    protein_columns_path: transcriptomics/output/protein_columns.json
+
+  num_bins: 10                 # expression bins (1-10, 0 = not detected)
+  has_protein_groups: true     # v2 data contains expanded protein groups (proteomics only)
+
+# Transfer learning (optional)
+transfer:
+  checkpoint_path:  model/trans_esmc/best_model.ckpt        # path to pretrained checkpoint (.ckpt), null = train from scratch
+  freeze_transformer: false      # freeze transformer layers initially
+  freeze_epochs: 0               # unfreeze after N epochs (0 = never freeze)
+
+device: cuda                   # e.g. cuda:0, cuda:1, cpu
+
+model:
+  d_model: 256                 # hidden dimension
+  n_heads: 8                   # attention heads
+  n_layers: 6                  # transformer blocks
+  d_ff: 1024                   # feedforward inner dimension
+  dropout: 0.1
+  input_proteins: 1024         # max detected individual proteins per sample (subsample if more, pad if fewer)
+  protein_context_ratio: 0.85  # fraction of individual proteins used as context
+  
+  use_esmc: true              # if true, replace learned protein embeddings with frozen ESM-C embeddings
+  fasta_path: fasta/human_proteome_canonical_31032022.fasta  # protein sequences for ESM-C
+  esmc_model: esmc_600m        # ESM-C model variant (esmc_300m or esmc_600m)
+  esmc_cache: data/esmc_cache.pt   # optional: pre-computed ESM-C embeddings (skips inference if present)
+  
+  # Optional absent proteins/genes modeling (both proteomics and transcriptomics)
+  absent_species:              
+    enabled: false              # true = add randomly sampled absent species to context
+    input_absent: 256           # dedicated sequence slots for absent species
+    absent_context_ratio: 0.50   # fraction as context (1.0 = all context, <1.0 = some become targets)
+  
+ # Optional protein group modeling (proteomics only)
+  protein_groups:               
+    enabled: false              # false = drop group proteins, only use individuals
+    max_group_size: 20          # groups > this are dropped entirely
+    input_groups: 256           # dedicated sequence slots for protein groups (0 = disable group segment)
+    group_context_ratio: 1.0    # fraction of groups as context (1.0 = all context, no group targets)
+    encoder: "mean"        # "attention" or "mean"
+    attention:
+      n_heads: 4
+      n_encoder_layers: 1
+
+training:
+  batch_size: 96
+  learning_rate: 0.0001
+  weight_decay: 1.0e-5
+  max_epochs: 200
+  val_frequency: 0.2           # how often to validate (0.1 = every 10% of epoch)
+  early_stopping_patience: 5000   # epochs without improvement before stopping
+  early_stopping_delta: 0.001  # minimum improvement to count
+  gradient_clip: 1.0
+  num_workers: 0
+
+output:
+  save_dir: model               # directory for checkpoints and logs
+  experiment_name: trans_prot_nsaf_diann_esmc   # subdirectory for this run
