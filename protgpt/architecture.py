@@ -138,9 +138,9 @@ class ProtGPT(nn.Module):
     """
     Transformer that learns to predict masked protein expression bins.
 
-    Input: dict from ProteomeCollator with role, protein_ids, bin_values tensors.
+    Input: dict from ExpressionCollator with role, feature_ids, bin_values tensors.
     Flow:
-        1. Embed tokens: protein_emb + bin_emb (targets get no bin signal).
+        1. Embed tokens: feature_emb + bin_emb (targets get no bin signal).
         2. Override position 0 with the Proteome Summary Token (PST).
         3. Run through transformer with custom attention mask:
            - PST + context attend to PST + context.
@@ -169,8 +169,8 @@ class ProtGPT(nn.Module):
                 nn.Linear(esmc_dim // 2, config['d_model']),
             )
         else:
-            # learned embeddings (index 0 = padding token, real proteins are 1..num_proteins)
-            self.protein_emb = nn.Embedding(config['num_proteins'] + 1, config['d_model'])
+            # learned embeddings (index 0 = padding token, real proteins are 1..num_features)
+            self.feature_emb = nn.Embedding(config['num_features'] + 1, config['d_model'])
 
         # bin embedding: 0 = not detected (absent proteins in context), 1..num_bins = expression bins
         self.bin_emb = nn.Embedding(config['num_bins'] + 1, config['d_model'])
@@ -201,7 +201,6 @@ class ProtGPT(nn.Module):
         # NOTE: for later application we could add more heads that predict other properties from the PST or target representations
         # one could be predicting if a protein is present in the proteome or not
         # or predicting which of 2 proteins is highest expressed, etc.
-        # p
         # this multi-task self-supervised setup could encourage the model to learn more general and useful representations of the proteome
 
         # protein group encoder (optional)
@@ -219,11 +218,11 @@ class ProtGPT(nn.Module):
 
         self._init_weights()
 
-    def _get_protein_emb(self, protein_ids):
+    def _get_feature_emb(self, feature_ids):
         """Return protein embeddings, using either learned or ESM-C embeddings."""
         if self.use_esmc and hasattr(self, 'esmc_embedding'):
-            return self.esmc_proj(self.esmc_embedding(protein_ids))
-        return self.protein_emb(protein_ids)
+            return self.esmc_proj(self.esmc_embedding(feature_ids))
+        return self.feature_emb(feature_ids)
 
     # weight init
     def _init_weights(self):
@@ -278,9 +277,9 @@ class ProtGPT(nn.Module):
         Batched forward with pre-collated sequences.
 
         Args:
-            batch: dict from ProteomeCollator with keys:
+            batch: dict from ExpressionCollator with keys:
                 role         (batch, input): 0=padding, 1=context/PST, 2=target
-                protein_ids  (batch, input): protein indices
+                feature_ids  (batch, input): protein indices
                 bin_values   (batch, input): true bin values
 
         Returns:
@@ -290,11 +289,11 @@ class ProtGPT(nn.Module):
                 pred_ctx           list of (num_targets,) tensors: ctx_head predictions per sample
                 pred_pst           list of (num_targets,) tensors: pst_head predictions per sample
                 true_bins          list of (num_targets,) tensors: ground-truth bins per sample
-                target_protein_ids list of (num_targets,) tensors: protein IDs for each target
+                target_feature_ids list of (num_targets,) tensors: protein IDs for each target
                 role               (batch, seq_len): passthrough of the role tensor
         """
         role        = batch["role"]          # (batch, input)
-        protein_ids = batch["protein_ids"]   # (batch, input, G)
+        feature_ids = batch["feature_ids"]   # (batch, input, G)
         bin_values  = batch["bin_values"]    # (batch, input)
         group_sizes = batch.get("group_sizes")  # (batch, input) or None
 
@@ -303,29 +302,31 @@ class ProtGPT(nn.Module):
         # protein identity embeddings
         if self.pg_enabled and group_sizes is not None:
             # protein groups: route individuals through direct lookup, groups through encoder
-            B, S, G = protein_ids.shape
+            B, S, G = feature_ids.shape
             d = self.config['d_model']
-            flat_ids = protein_ids.reshape(B * S, G)
+            flat_ids = feature_ids.reshape(B * S, G)
             flat_sizes = group_sizes.reshape(B * S)
 
             is_pg = flat_sizes > 1
             pg_idx = is_pg.nonzero(as_tuple=True)[0]
             indiv_idx = (~is_pg).nonzero(as_tuple=True)[0]
 
-            prot_emb = torch.zeros(B * S, d, device=protein_ids.device)
+            prot_emb = torch.zeros(B * S, d, device=feature_ids.device)
 
+            # .to(prot_emb.dtype): under autocast the ESM-C projection / group encoder
+            # may return bf16, but prot_emb is float32 — index_put requires a dtype match.
             if indiv_idx.numel() > 0:
-                prot_emb[indiv_idx] = self._get_protein_emb(flat_ids[indiv_idx, 0])
+                prot_emb[indiv_idx] = self._get_feature_emb(flat_ids[indiv_idx, 0]).to(prot_emb.dtype)
 
             if pg_idx.numel() > 0:
-                pg_emb = self._get_protein_emb(flat_ids[pg_idx])
+                pg_emb = self._get_feature_emb(flat_ids[pg_idx])
                 pg_out = self.group_encoder(pg_emb, flat_sizes[pg_idx])
-                prot_emb[pg_idx] = pg_out
+                prot_emb[pg_idx] = pg_out.to(prot_emb.dtype)
 
             prot_emb = prot_emb.reshape(B, S, d)
         else:
-            # no groups: all positions are individual, use first column of protein_ids
-            prot_emb = self._get_protein_emb(protein_ids[:, :, 0])
+            # no groups: all positions are individual, use first column of feature_ids
+            prot_emb = self._get_feature_emb(feature_ids[:, :, 0])
 
         # bin embeddings: targets get no bin signal (zeroed out), only protein identity
         bin_emb = self.bin_emb(bin_values)
@@ -359,7 +360,7 @@ class ProtGPT(nn.Module):
             pred_pst = self.pst_head(pst_input).squeeze(-1)  # (N_total,)
 
             true_bins_flat = bin_values[batch_idx, seq_idx].float()
-            tgt_ids_flat = protein_ids[batch_idx, seq_idx]
+            tgt_ids_flat = feature_ids[batch_idx, seq_idx]
 
             # split back into per-sample lists
             counts = tgt_mask.sum(dim=1)  # (B,)
@@ -381,7 +382,7 @@ class ProtGPT(nn.Module):
             "pred_ctx":           all_pred_ctx,
             "pred_pst":           all_pred_pst,
             "true_bins":          all_true_bins,
-            "target_protein_ids": all_target_ids,
+            "target_feature_ids": all_target_ids,
             "role":               role,
         }
 
@@ -393,7 +394,7 @@ class ProtGPT(nn.Module):
         regardless of its target count).
 
         Args:
-            batch: dict from ProteomeCollator (same as forward()).
+            batch: dict from ExpressionCollator (same as forward()).
 
         Returns:
             (total_loss, ctx_loss, pst_loss)

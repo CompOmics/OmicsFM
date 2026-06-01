@@ -44,6 +44,8 @@ _setup_logging()
 log = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))  # make `protgpt` and `transcriptomics` importable
 
 DTYPE_MAP = {
     "uint8": np.uint8,
@@ -72,10 +74,12 @@ META_COLUMNS = [
 @dataclass
 class GeneProteinMap:
     """Holds the gene→protein mapping and sparse projection matrix."""
-    protein_columns: list[str]          # sorted UniProt accessions (output column order)
+    protein_columns: list[str]          # sorted UniProt accessions (projected output columns)
     projection: csr_matrix              # (n_census_genes × n_proteins), for X @ P
     mt_gene_indices: np.ndarray         # Census gene indices for mitochondrial genes
     census_var_df: pd.DataFrame         # Census gene metadata (feature_id, feature_name)
+    gene_columns: list[str]             # Ensembl gene ids of mapped genes (no-projection output columns)
+    mapped_gene_indices: np.ndarray     # Census gene indices that map to a model protein
 
 
 def get_model_proteins(parquet_path: str) -> list[str]:
@@ -142,6 +146,13 @@ def ensure_gene_protein_map(config: dict, census) -> GeneProteinMap:
     ).tocsr()
     log.info(f"Projection matrix: {projection.shape}, {projection.nnz} mappings")
 
+    # Gene-level (no-projection) output columns: the mapped genes, by Ensembl id.
+    # `rows` already holds each mapped gene index exactly once, in ascending order.
+    mapped_gene_indices = np.array(rows, dtype=np.int64)
+    feat_ids = var_df["feature_id"].str.split(".").str[0].values
+    gene_columns = feat_ids[mapped_gene_indices].tolist()
+    log.info(f"Mapped genes (no-projection columns): {len(gene_columns)}")
+
     # Identify mitochondrial gene indices (by gene symbol prefix)
     mt_mask = var_df["feature_name"].str.startswith("MT-", na=False)
     mt_gene_indices = np.where(mt_mask.values)[0]
@@ -152,6 +163,8 @@ def ensure_gene_protein_map(config: dict, census) -> GeneProteinMap:
         projection=projection,
         mt_gene_indices=mt_gene_indices,
         census_var_df=var_df,
+        gene_columns=gene_columns,
+        mapped_gene_indices=mapped_gene_indices,
     )
 
 
@@ -319,8 +332,13 @@ def fetch_and_process_tissue(
         log.info(f"  [{tissue}] No cells survived QC, skipping")
         return None
 
-    # Step 5: Project genes → proteins (sparse matmul)
-    X_protein = X_census @ gene_map.projection
+    # Step 5: either project genes → proteins, or keep mapped genes (native gene ids)
+    if config.get("project_to_proteins", True):
+        X_out = X_census @ gene_map.projection                  # gene→protein (sums genes per protein)
+        unit = "proteins"
+    else:
+        X_out = X_census[:, gene_map.mapped_gene_indices].tocsr()  # keep mapped genes, gene ids
+        unit = "genes"
     del X_census
 
     # Step 6: Cast dtype
@@ -329,17 +347,17 @@ def fetch_and_process_tissue(
     max_val = DTYPE_MAX[dtype_name]
 
     if np.issubdtype(dtype, np.integer):
-        X_protein.data = np.clip(X_protein.data, 0, max_val).astype(dtype)
+        X_out.data = np.clip(X_out.data, 0, max_val).astype(dtype)
     else:
-        X_protein.data = X_protein.data.astype(dtype)
+        X_out.data = X_out.data.astype(dtype)
 
     # Eliminate zeros that may have been introduced
-    X_protein.eliminate_zeros()
+    X_out.eliminate_zeros()
 
-    log.info(f"  [{tissue}] Done: {X_protein.shape[0]:,} cells × {X_protein.shape[1]:,} proteins, "
-             f"nnz={X_protein.nnz:,}, dtype={dtype_name} ({time.time()-t0:.1f}s)")
+    log.info(f"  [{tissue}] Done: {X_out.shape[0]:,} cells × {X_out.shape[1]:,} {unit}, "
+             f"nnz={X_out.nnz:,}, dtype={dtype_name} ({time.time()-t0:.1f}s)")
 
-    return X_protein, obs_df
+    return X_out, obs_df
 
 
 # ── Split & Reorder ──────────────────────────────────────────────────────
@@ -415,33 +433,29 @@ def _split_and_reorder(
 
 def save_dataset(output_dir: Path, X: csr_matrix, metadata: pd.DataFrame,
                  protein_columns: list[str], config: dict):
-    """Save the final dataset: sparse matrix, metadata, column labels, config."""
+    """Save the dataset natively as a single unified `expression.h5ad`.
+
+    Bundles the sparse matrix (X), per-cell metadata (obs), and protein/gene
+    accessions (var) in one file — the format consumed by split_dataset.py and
+    protgpt.data.ExpressionDataset.
+    """
+    from protgpt.convert import save_unified_h5ad
+
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Expression matrix
     t0 = time.time()
-    npz_path = output_dir / "expression.npz"
-    log.info(f"Saving {npz_path} ({X.shape[0]:,} × {X.shape[1]:,}, nnz={X.nnz:,})...")
-    compressed = config.get("compress_output", False)
-    save_npz(str(npz_path), X, compressed=compressed)
-    log.info(f"  compressed={compressed}")
-    size_mb = npz_path.stat().st_size / 1e6
-    log.info(f"  Saved expression.npz: {size_mb:.1f} MB ({time.time()-t0:.1f}s)")
 
-    # Metadata
-    meta_path = output_dir / "metadata.parquet"
-    metadata.to_parquet(str(meta_path), index=False)
-    log.info(f"  Saved metadata.parquet: {len(metadata):,} rows")
+    metadata = metadata.reset_index(drop=True)
+    metadata.index = pd.Index([f"cell_{i}" for i in range(len(metadata))], name="cell_id")
 
-    # Protein column labels
-    cols_path = output_dir / "protein_columns.json"
-    with open(cols_path, "w") as f:
-        json.dump(protein_columns, f)
-    log.info(f"  Saved protein_columns.json: {len(protein_columns)} proteins")
+    h5ad_path = output_dir / "expression.h5ad"
+    log.info(f"Saving {h5ad_path} ({X.shape[0]:,} × {X.shape[1]:,}, nnz={X.nnz:,})...")
+    save_unified_h5ad(str(h5ad_path), X, metadata, protein_columns,
+                      modality="transcriptomics", value_semantics="umi_counts")
+    size_mb = h5ad_path.stat().st_size / 1e6
+    log.info(f"  Saved expression.h5ad: {size_mb:.1f} MB ({time.time()-t0:.1f}s)")
 
-    # Config copy
-    config_path = output_dir / "config.yaml"
-    with open(config_path, "w") as f:
+    # Config copy (provenance)
+    with open(output_dir / "config.yaml", "w") as f:
         yaml.dump(config, f, default_flow_style=False)
     log.info(f"  Saved config.yaml")
 
@@ -480,6 +494,9 @@ def main():
     parser.add_argument("--tissues", nargs="+", default=None, help="Override tissue list")
     parser.add_argument("--cells-per-tissue", type=int, default=None, help="Override cells_per_tissue")
     parser.add_argument("--workers", type=int, default=None, help="Override number of parallel workers")
+    parser.add_argument("--no-projection", action="store_true",
+                        help="Keep native Ensembl gene accessions instead of projecting to proteins")
+    parser.add_argument("--output-dir", default=None, help="Override output_dir from config")
     args = parser.parse_args()
 
     # Load config
@@ -494,6 +511,10 @@ def main():
         config["tissues"] = args.tissues
     if args.cells_per_tissue:
         config["cells_per_tissue"] = args.cells_per_tissue
+    if args.no_projection:
+        config["project_to_proteins"] = False
+    if args.output_dir:
+        config["output_dir"] = args.output_dir
 
     output_dir = ROOT / config["output_dir"]
     tissues = config["tissues"]
@@ -584,8 +605,10 @@ def main():
     log.info(f"Combined: {X_all.shape[0]:,} cells × {X_all.shape[1]:,} proteins, "
              f"nnz={X_all.nnz:,}, density={density:.2f}%, {mem_mb:.0f} MB")
 
-    # Save
-    save_dataset(output_dir, X_all, meta_all, gene_map.protein_columns, config)
+    # Save (columns are proteins or genes depending on projection mode)
+    columns = (gene_map.protein_columns if config.get("project_to_proteins", True)
+               else gene_map.gene_columns)
+    save_dataset(output_dir, X_all, meta_all, columns, config)
 
     elapsed = time.time() - t_start
     log.info(f"")

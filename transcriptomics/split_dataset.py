@@ -1,15 +1,13 @@
 """
 Split the transcriptomics dataset by dataset_id into train/valid/test.
 
-Reads expression.npz + metadata.parquet, splits by dataset_id using greedy
-tissue-stratified balancing, and outputs per-split files:
-  - train.npz, valid.npz, test.npz (sparse expression matrices)
-  - train_metadata.parquet, valid_metadata.parquet, test_metadata.parquet
+Reads the unified expression.h5ad, splits by dataset_id using greedy
+tissue-stratified balancing, and outputs one unified file per split:
+  - train.h5ad, valid.h5ad, test.h5ad  (sparse X + obs metadata + var accessions)
 
 Usage:
     python transcriptomics/split_dataset.py \
-      --expression transcriptomics/output/expression.npz \
-      --metadata transcriptomics/output/metadata.parquet \
+      --expression transcriptomics/output/expression.h5ad \
       --output-dir transcriptomics/split \
       --train-frac 0.9 --valid-frac 0.05 --test-frac 0.05
 """
@@ -23,7 +21,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import yaml
-from scipy.sparse import load_npz, save_npz
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))  # make `protgpt` importable when run as a script
 
 logging.basicConfig(
     level=logging.INFO,
@@ -128,15 +129,13 @@ def main():
         epilog="Use --config to read all settings from pipeline_config.yaml, "
                "or pass individual arguments.",
     )
-    parser.add_argument("--config", help="Path to pipeline_config.yaml (reads output_dir, split, seed, compress_output)")
-    parser.add_argument("--expression", help="Path to expression.npz")
-    parser.add_argument("--metadata", help="Path to metadata.parquet")
+    parser.add_argument("--config", help="Path to pipeline_config.yaml (reads output_dir, split, seed)")
+    parser.add_argument("--expression", help="Path to expression.h5ad")
     parser.add_argument("--output-dir", help="Output directory for split files")
     parser.add_argument("--train-frac", type=float)
     parser.add_argument("--valid-frac", type=float)
     parser.add_argument("--test-frac", type=float)
     parser.add_argument("--seed", type=int)
-    parser.add_argument("--compress", action="store_true", help="Compress output npz files")
     args = parser.parse_args()
 
     # Load defaults from config if provided
@@ -147,26 +146,22 @@ def main():
         build_output = cfg.get("output_dir", "transcriptomics/output")
 
         # Config-derived defaults (CLI args override)
-        expression = args.expression or str(Path(build_output) / "expression.npz")
-        metadata = args.metadata or str(Path(build_output) / "metadata.parquet")
+        expression = args.expression or str(Path(build_output) / "expression.h5ad")
         output_dir = Path(args.output_dir or split_cfg.get("output_dir", "transcriptomics/split"))
         train_frac = args.train_frac if args.train_frac is not None else split_cfg.get("train_frac", 0.9)
         valid_frac = args.valid_frac if args.valid_frac is not None else split_cfg.get("valid_frac", 0.05)
         test_frac = args.test_frac if args.test_frac is not None else split_cfg.get("test_frac", 0.05)
         seed = args.seed if args.seed is not None else cfg.get("seed", 42)
-        compress = args.compress or cfg.get("compress_output", False)
     else:
         # All args required without config
-        if not args.expression or not args.metadata or not args.output_dir:
-            parser.error("--expression, --metadata, and --output-dir are required without --config")
+        if not args.expression or not args.output_dir:
+            parser.error("--expression and --output-dir are required without --config")
         expression = args.expression
-        metadata = args.metadata
         output_dir = Path(args.output_dir)
         train_frac = args.train_frac or 0.9
         valid_frac = args.valid_frac or 0.05
         test_frac = args.test_frac or 0.05
         seed = args.seed or 42
-        compress = args.compress
 
     total_frac = train_frac + valid_frac + test_frac
     if abs(total_frac - 1.0) > 0.01:
@@ -175,43 +170,35 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     log.info(f"Expression: {expression}")
-    log.info(f"Metadata:   {metadata}")
     log.info(f"Output:     {output_dir}")
     log.info(f"Split:      {train_frac}/{valid_frac}/{test_frac}")
 
-    # Load metadata
-    log.info("Loading metadata...")
-    meta = pd.read_parquet(metadata)
-    log.info(f"  {len(meta):,} cells, {meta['dataset_id'].nunique()} datasets")
+    # Load the unified source (X + obs metadata + var accessions)
+    import anndata as ad
+    from protgpt.convert import save_unified_h5ad
+
+    log.info("Loading expression.h5ad...")
+    t0 = time.time()
+    adata = ad.read_h5ad(expression)
+    X = adata.X.tocsr()
+    meta = adata.obs
+    var_names = list(adata.var_names)
+    log.info(f"  Loaded {X.shape[0]:,} × {X.shape[1]:,}, "
+             f"{meta['dataset_id'].nunique()} datasets ({time.time()-t0:.1f}s)")
 
     # Assign splits
     assignment = greedy_stratified_split(meta, train_frac, valid_frac, test_frac, seed)
-    meta["split"] = meta["dataset_id"].map(assignment)
+    split_of = meta["dataset_id"].map(assignment).values
 
-    # Load expression matrix
-    log.info("Loading expression matrix...")
-    t0 = time.time()
-    X = load_npz(expression)
-    log.info(f"  Loaded {X.shape[0]:,} × {X.shape[1]:,} ({time.time()-t0:.1f}s)")
-
-    # Write per-split files
+    # Write one unified .h5ad per split
     for split in ["train", "valid", "test"]:
-        mask = meta["split"].values == split
-        indices = np.where(mask)[0]
-
-        # Expression
-        X_split = X[indices]
-        npz_path = output_dir / f"{split}.npz"
-        log.info(f"Saving {npz_path}: {X_split.shape[0]:,} cells...")
+        indices = np.where(split_of == split)[0]
+        out_path = output_dir / f"{split}.h5ad"
+        log.info(f"Saving {out_path}: {len(indices):,} cells...")
         t0 = time.time()
-        save_npz(str(npz_path), X_split, compressed=compress)
+        save_unified_h5ad(str(out_path), X[indices], meta.iloc[indices], var_names,
+                          modality="transcriptomics", value_semantics="umi_counts")
         log.info(f"  Saved ({time.time()-t0:.1f}s)")
-
-        # Metadata
-        meta_split = meta[mask].drop(columns=["split"]).reset_index(drop=True)
-        meta_path = output_dir / f"{split}_metadata.parquet"
-        meta_split.to_parquet(str(meta_path), index=False)
-        log.info(f"  Saved {meta_path}: {len(meta_split):,} rows")
 
     del X
     log.info("Done!")

@@ -18,7 +18,7 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader
 from pathlib import Path
 
-from protgpt.data import ProteomeDataset, TranscriptomicsDataset, ProteomeCollator
+from protgpt.data import ExpressionDataset, ExpressionCollator
 from protgpt.architecture import ProtGPT
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s", datefmt="%H:%M:%S")
@@ -31,14 +31,12 @@ def load_config(path: str) -> dict:
 
 
 def load_dataset(path: str, num_bins: int, detect_groups: bool = False,
-                  max_group_size: int = 1, group_cache_path: str = None,
-                  include_absent: bool = False) -> ProteomeDataset:
+                 max_group_size: int = 1) -> ExpressionDataset:
+    """Load a unified .h5ad source as an ExpressionDataset (builds its cache if needed)."""
     log.info(f"Loading {path} ...")
-    df = pd.read_parquet(path)
-    ds = ProteomeDataset(df, num_bins=num_bins, detect_groups=detect_groups,
-                         max_group_size=max_group_size, group_cache_path=group_cache_path,
-                         include_absent=include_absent)
-    log.info(f"  → {len(ds)} samples, {ds.num_proteins()} proteins\n")
+    ds = ExpressionDataset(path, num_bins=num_bins, detect_groups=detect_groups,
+                           max_group_size=max_group_size)
+    log.info(f"  → {len(ds)} samples, {ds.num_features()} features ({ds.modality})\n")
     return ds
 
 
@@ -72,65 +70,31 @@ def train(config_path: str):
     device = torch.device(cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
     log.info(f"Device: {device}")
 
-    # data
-    modality = dcfg.get("modality", "proteomics")
-    log.info(f"Modality: {modality}")
-
+    # data — unified .h5ad source for both modalities (see protgpt/convert.py)
     pg_cfg = mcfg.get("protein_groups", {})
     pg_enabled = pg_cfg.get("enabled", False)
     abs_cfg = mcfg.get("absent_species", {})
     abs_enabled = abs_cfg.get("enabled", False)
-    include_absent = abs_enabled
 
-    if modality == "transcriptomics" and pg_enabled:
+    detect_groups = dcfg.get("detect_groups", False)
+    # max_group_size>1 only when groups are modeled; otherwise grouped proteins are dropped
+    max_group_size = pg_cfg.get("max_group_size", 1) if pg_enabled else 1
+
+    train_ds = load_dataset(dcfg["train_path"], dcfg["num_bins"], detect_groups, max_group_size)
+    valid_ds = load_dataset(dcfg["valid_path"], dcfg["num_bins"], detect_groups, max_group_size)
+    test_ds  = load_dataset(dcfg["test_path"],  dcfg["num_bins"], detect_groups, max_group_size)
+    feature_names = train_ds.feature_names
+
+    if train_ds.modality == "transcriptomics" and pg_enabled:
         log.warning("Protein groups not supported for transcriptomics — disabling")
         pg_enabled = False
 
-    if modality == "proteomics":
-        detect_groups = dcfg.get("has_protein_groups", False)
-        max_group_size = pg_cfg.get("max_group_size", 1) if pg_enabled else 1
-
-        def _group_cache(data_path):
-            if not detect_groups:
-                return None
-            p = Path(data_path)
-            return str(p.parent / f"{p.stem}_groups.pt")
-
-        pcfg = dcfg.get("proteomics", dcfg)  # fallback to flat dcfg for backward compat
-        train_ds = load_dataset(pcfg["train_path"], dcfg["num_bins"], detect_groups=detect_groups, max_group_size=max_group_size, group_cache_path=_group_cache(pcfg["train_path"]), include_absent=include_absent)
-        valid_ds = load_dataset(pcfg["valid_path"], dcfg["num_bins"], detect_groups=detect_groups, max_group_size=max_group_size, group_cache_path=_group_cache(pcfg["valid_path"]), include_absent=include_absent)
-        test_ds  = load_dataset(pcfg["test_path"],  dcfg["num_bins"], detect_groups=detect_groups, max_group_size=max_group_size, group_cache_path=_group_cache(pcfg["test_path"]), include_absent=include_absent)
-        protein_names = list(train_ds.data.index)
-
-    elif modality == "transcriptomics":
-        scfg = dcfg["transcriptomics"]
-        def _sc_cache(npz_path):
-            """Derive cache path from npz path: train.npz → train_cache/"""
-            p = Path(npz_path)
-            return str(p.parent / f"{p.stem}_cache")
-
-        sc_kwargs = dict(
-            protein_columns_path=scfg["protein_columns_path"],
-            num_bins=dcfg["num_bins"],
-            include_absent=include_absent,
-        )
-        train_ds = TranscriptomicsDataset(expression_path=scfg["train_path"],
-                                          cache_path=_sc_cache(scfg["train_path"]), **sc_kwargs)
-        valid_ds = TranscriptomicsDataset(expression_path=scfg["valid_path"],
-                                          cache_path=_sc_cache(scfg["valid_path"]), **sc_kwargs)
-        test_ds  = TranscriptomicsDataset(expression_path=scfg["test_path"],
-                                          cache_path=_sc_cache(scfg["test_path"]), **sc_kwargs)
-        protein_names = train_ds.protein_columns
-
-    else:
-        raise ValueError(f"Unknown modality: {modality}")
-
-    collator = ProteomeCollator(
-        protein_context_ratio=mcfg["protein_context_ratio"],
+    collator = ExpressionCollator(
+        num_features=train_ds.num_features(),
+        feature_context_ratio=mcfg["feature_context_ratio"],
         group_context_ratio=pg_cfg.get("group_context_ratio", 1.0),
-        input_proteins=mcfg["input_proteins"],
+        input_features=mcfg["input_features"],
         protein_groups_enabled=pg_enabled,
-        max_group_size=pg_cfg.get("max_group_size", 1),
         input_groups=pg_cfg.get("input_groups", 0) if pg_enabled else 0,
         absent_species_enabled=abs_enabled,
         input_absent=abs_cfg.get("input_absent", 0),
@@ -144,7 +108,7 @@ def train(config_path: str):
 
     # model
     model_cfg = {
-        "num_proteins": train_ds.num_proteins(),
+        "num_features": train_ds.num_features(),
         "num_bins": dcfg["num_bins"],
         "d_model": mcfg["d_model"],
         "n_heads": mcfg["n_heads"],
@@ -161,7 +125,7 @@ def train(config_path: str):
     if model_cfg["use_esmc"]:
         from protgpt.esmc_utils import build_esmc_lookup
         esmc_lookup = build_esmc_lookup(
-            protein_names,
+            feature_names,
             mcfg["fasta_path"],
             mcfg.get("esmc_model", "esmc_600m"),
             cache_path=mcfg.get("esmc_cache"),
@@ -187,27 +151,27 @@ def train(config_path: str):
             state_dict.pop("esmc_embedding.weight")
 
         # Learned protein embedding: remap rows by accession if protein list changed.
-        if "protein_emb.weight" in state_dict:
-            old_names = ckpt["protein_names"]
-            old_w = state_dict["protein_emb.weight"]
-            cur_w = model.protein_emb.weight.data
-            if old_names != protein_names:
+        if "feature_emb.weight" in state_dict:
+            old_names = ckpt["feature_names"]
+            old_w = state_dict["feature_emb.weight"]
+            cur_w = model.feature_emb.weight.data
+            if old_names != feature_names:
                 old_idx = {name: i for i, name in enumerate(old_names)}
                 # row 0 is padding in both → keep as-is in cur_w
                 new_w = cur_w.clone()
                 new_w[0] = old_w[0]
                 fresh_init = []
-                for i, name in enumerate(protein_names, start=1):
+                for i, name in enumerate(feature_names, start=1):
                     j = old_idx.get(name)
                     if j is not None:
                         new_w[i] = old_w[j + 1]  # +1 skips pad row in old
                     else:
                         fresh_init.append(name)
-                dropped = [n for n in old_names if n not in set(protein_names)]
-                state_dict["protein_emb.weight"] = new_w
-                matched = len(protein_names) - len(fresh_init)
-                log.info(f"  Remapped protein_emb.weight by accession: "
-                         f"{matched}/{len(protein_names)} rows transferred")
+                dropped = [n for n in old_names if n not in set(feature_names)]
+                state_dict["feature_emb.weight"] = new_w
+                matched = len(feature_names) - len(fresh_init)
+                log.info(f"  Remapped feature_emb.weight by accession: "
+                         f"{matched}/{len(feature_names)} rows transferred")
                 if fresh_init:
                     log.info(f"  Fresh init: {len(fresh_init)} proteins new to this run "
                              f"(not in checkpoint)")
@@ -343,7 +307,7 @@ def train(config_path: str):
                 if vl < best_val_loss - tcfg["early_stopping_delta"]:
                     best_val_loss = vl
                     patience_counter = 0
-                    torch.save({"model": model.state_dict(), "config": cfg, "epoch": epoch, "val_loss": vl, "protein_names": protein_names}, best_path)
+                    torch.save({"model": model.state_dict(), "config": cfg, "epoch": epoch, "val_loss": vl, "feature_names": feature_names}, best_path)
                     log.info(f"  ✓ New best model saved (val_loss={vl:.4f})")
                 else:
                     patience_counter += 1
@@ -373,7 +337,7 @@ def train(config_path: str):
         if vl < best_val_loss - tcfg["early_stopping_delta"]:
             best_val_loss = vl
             patience_counter = 0
-            torch.save({"model": model.state_dict(), "config": cfg, "epoch": epoch, "val_loss": vl, "protein_names": protein_names}, best_path)
+            torch.save({"model": model.state_dict(), "config": cfg, "epoch": epoch, "val_loss": vl, "feature_names": feature_names}, best_path)
             log.info(f"  ✓ New best model saved (val_loss={vl:.4f})")
         else:
             patience_counter += 1

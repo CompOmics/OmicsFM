@@ -79,9 +79,7 @@ split:
 
 ```
 transcriptomics/output/
-├── expression.npz          # scipy sparse CSR (n_cells × n_proteins), uint8
-├── metadata.parquet        # per-cell metadata (dataset_id, cell_type, tissue, ...)
-├── protein_columns.json    # ordered list of UniProt accessions (column labels)
+├── expression.h5ad         # AnnData: sparse CSR X (uint8) + obs (cell metadata) + var (accessions)
 └── config.yaml             # copy of the config used
 ```
 
@@ -89,58 +87,49 @@ transcriptomics/output/
 
 ```
 transcriptomics/split/
-├── train.npz               # training expression matrix
-├── train_metadata.parquet   # training cell metadata
-├── valid.npz
-├── valid_metadata.parquet
-├── test.npz
-└── test_metadata.parquet
+├── train.h5ad              # one self-describing file per split
+├── valid.h5ad              #   (X + obs metadata + var accessions bundled)
+└── test.h5ad
 ```
 
-Row i in `train.npz` corresponds to row i in `train_metadata.parquet`.
+Everything (matrix, per-cell metadata, protein/gene accessions) lives in one
+`.h5ad` file per split — the unified format consumed by `protgpt.data.ExpressionDataset`.
 
 ## Loading the data
 
 ```python
-from scipy.sparse import load_npz
-import pandas as pd
-import json
+import anndata as ad
 
-# Load one split
-X_train = load_npz("transcriptomics/split/train.npz")  # sparse CSR, loads in seconds
-meta_train = pd.read_parquet("transcriptomics/split/train_metadata.parquet")
-
-# Column labels (shared across splits)
-with open("transcriptomics/output/protein_columns.json") as f:
-    protein_cols = json.load(f)
-
-print(X_train.shape)      # (n_cells, 20274)
-print(X_train.dtype)       # uint8
-print(len(protein_cols))   # 20274
+A = ad.read_h5ad("transcriptomics/split/train.h5ad")   # or backed="r" for out-of-core
+print(A.shape)                # (n_cells, 20274)
+print(A.X.dtype)              # uint8  (raw UMI counts)
+print(list(A.var_names[:3]))  # UniProt accessions (column labels)
+print(A.obs.columns.tolist()) # per-cell metadata (dataset_id, cell_type, tissue, ...)
 ```
 
 ## Training with ProtGPT
 
-Set `modality: "transcriptomics"` in `config/training/setup.yaml`:
+Point `config/training/setup.yaml` at the split h5ad files (modality is read from the
+file itself, so set `detect_groups: false` for transcriptomics):
 
 ```yaml
 data:
-  modality: "transcriptomics"
-  transcriptomics:
-    train_path: transcriptomics/split/train.npz
-    valid_path: transcriptomics/split/valid.npz
-    test_path: transcriptomics/split/test.npz
-    protein_columns_path: transcriptomics/output/protein_columns.json
+  train_path: transcriptomics/split/train.h5ad
+  valid_path: transcriptomics/split/valid.h5ad
+  test_path:  transcriptomics/split/test.h5ad
+  num_bins: 10
+  detect_groups: false   # no protein groups for transcriptomics
 ```
 
-For transfer learning (pretrain on transcriptomics, fine-tune on proteomics):
+For transfer learning (pretrain on transcriptomics, fine-tune on proteomics), point the
+fine-tuning config at the proteomics h5ad and load the pretrained checkpoint:
 
 ```yaml
-# config for fine-tuning step
 data:
-  modality: "proteomics"
+  train_path: data/nsaf_diann/train.h5ad
+  detect_groups: true
 transfer:
-  checkpoint_path: runs/pretrain_sc/best_model.ckpt
+  checkpoint_path: model/pretrain_sc/best_model.ckpt
 ```
 
 ## Sampling strategy

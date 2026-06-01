@@ -1,629 +1,509 @@
-# loading data into object, normalization, transposition to have samples as columns and proteins as rows
+"""
+Unified data layer for ProtGPT.
+
+Both modalities (proteomics, transcriptomics) share one on-disk **source** format —
+a `.h5ad` file with raw (unbinned) values, protein/gene accessions in `var_names`,
+and per-sample metadata in `obs` (see docs/unified_data_format_plan.md and
+protgpt/convert.py).
+
+`ExpressionDataset` reads an h5ad source and, on first use, builds a compact,
+**binned**, ragged CSR **cache** (flat `.npy` arrays) keyed by the binning/group
+config. The cache is memory-mapped (or loaded fully into RAM when it fits), so the
+training hot-loop never touches the h5ad and never holds the full matrix in RAM.
+
+`ExpressionCollator` assembles batches: a `[PST | individuals | groups | absent]`
+sequence with per-type subsampling. Protein groups are stored ragged and padded to
+the **batch-local** max group size; absent species are sampled on the fly.
+"""
+
+import hashlib
 import json
-import os
-import numpy as np
 import logging
-import pandas as pd
+import os
+
+import numpy as np
 import torch
-from tqdm import tqdm
 from torch.utils.data import Dataset
+from tqdm import tqdm
+import anndata as ad
+
+log = logging.getLogger(__name__)
+
+CACHE_VERSION = 2  # bumped: feature-axis rename changed cache file names
+_BUILD_BLOCK = 8192  # rows per block when streaming the h5ad during cache build
 
 
-class ProteomeDataset(Dataset):
-    def __init__(self, data, num_bins=10, detect_groups=False, max_group_size=1,
-                 group_cache_path=None, include_absent=False):
-        #NOTE: expected data is: columns: pxd_accession, run_name, protein_1, protein_2, ..., rows = samples
-        self.data = data
-        self.detect_groups = detect_groups
-        self.max_group_size = max_group_size
-        self.include_absent = include_absent
-        if detect_groups:
-            self._detect_protein_groups()  # before binning — uses raw abundance values!
-        self.normalize_dataset(bins=num_bins)
-        self.transpose_data()
-        self._load_or_precompute_positions(group_cache_path)
+# ── helpers ──────────────────────────────────────────────────────────────────
 
-    def __getitem__(self, idx):
-        """Return precomputed sample data for the collator.
-
-        Always returns (exp_prot_ids, exp_bins) for detected/expressed proteins.
-        When include_absent=True, also returns absent_ids.
-        """
-        if self.include_absent:
-            return self.exp_prot_ids[idx], self.exp_bins[idx], self.absent_ids[idx]
-        return self.exp_prot_ids[idx], self.exp_bins[idx]
-
-    def __len__(self):
-        return len(self.data.columns)
-
-    def num_proteins(self):
-        return len(self.data.index)
-
-    # ── precomputation ──────────────────────────────────────────────────
-
-    def _load_or_precompute_positions(self, cache_path=None):
-        """Load precomputed positions from cache or compute and save them."""
-        n_samples = len(self.data.columns)
-
-        if cache_path and os.path.exists(cache_path):
-            logging.info(f"Loading precomputed positions from cache: {cache_path}")
-            cache = torch.load(cache_path, map_location="cpu", weights_only=False)
-            if (cache.get("n_samples") == n_samples
-                    and cache.get("max_group_size") == self.max_group_size
-                    and cache.get("n_proteins") == self.num_proteins()
-                    and cache.get("detect_groups") == self.detect_groups
-                    and cache.get("include_absent") == self.include_absent):
-                self.exp_prot_ids = cache["exp_prot_ids"]
-                self.exp_bins = cache["exp_bins"]
-                if self.include_absent:
-                    self.absent_ids = cache["absent_ids"]
-                logging.info(f"  Loaded {n_samples} cached samples")
-                return
-            else:
-                logging.info(f"  Cache mismatch, recomputing...")
-
-        self._precompute_positions()
-
-        if cache_path:
-            os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
-            save_dict = {
-                "exp_prot_ids": self.exp_prot_ids,
-                "exp_bins": self.exp_bins,
-                "n_samples": n_samples,
-                "n_proteins": self.num_proteins(),
-                "max_group_size": self.max_group_size,
-                "detect_groups": self.detect_groups,
-                "include_absent": self.include_absent,
-            }
-            if self.include_absent:
-                save_dict["absent_ids"] = self.absent_ids
-            torch.save(save_dict, cache_path)
-            logging.info(f"  Saved position cache to {cache_path}")
-
-    def _precompute_positions(self):
-        """Precompute per-sample position tensors.
-
-        For each sample, produces:
-          prot_ids: (n_positions, max_group_size) — detected protein IDs (1-based), 0=padding
-          bins:     (n_positions,) — expression bins (1..num_bins)
-          absent_ids: (n_absent,) — protein IDs with zero expression (only when include_absent)
-
-        When detect_groups=True: proteins with identical values are collapsed into groups.
-        When detect_groups=False: every detected protein gets its own position (size 1).
-        """
-        G = self.max_group_size
-        n_samples = len(self.data.columns)
-        self.exp_prot_ids = []
-        self.exp_bins = []
-        if self.include_absent:
-            self.absent_ids = []
-
-        for idx in tqdm(range(n_samples), desc="Precomputing proteome metadata"):
-            sample_bins = torch.tensor(self.data.iloc[:, idx].values, dtype=torch.long)
-
-            # collect absent protein IDs before any filtering
-            if self.include_absent:
-                absent_mask = sample_bins == 0
-                self.absent_ids.append(absent_mask.nonzero(as_tuple=False).squeeze(-1) + 1)  # 1-based
-
-            if self.detect_groups:
-                prot_ids, bins = self._precompute_with_groups(idx, sample_bins, G)
-            else:
-                prot_ids, bins = self._precompute_no_groups(sample_bins, G)
-
-            self.exp_prot_ids.append(prot_ids)
-            self.exp_bins.append(bins)
-
-        logging.info(f"Precomputed positions for {n_samples} samples\n")
-
-    def _precompute_no_groups(self, sample_bins, G):
-        """Each detected protein becomes its own position (size 1)."""
-        detected_mask = sample_bins > 0
-        detected_indices = detected_mask.nonzero(as_tuple=True)[0]
-        n_det = len(detected_indices)
-
-        if n_det == 0:
-            return torch.zeros(0, G, dtype=torch.long), torch.zeros(0, dtype=torch.long)
-
-        prot_ids = torch.zeros(n_det, G, dtype=torch.long)
-        prot_ids[:, 0] = detected_indices + 1  # 1-based
-        bins = sample_bins[detected_indices]
-        return prot_ids, bins
-
-    def _precompute_with_groups(self, idx, sample_bins, G):
-        """Collapse proteins with identical values into groups."""
-        gids = torch.tensor(self.group_ids.iloc[:, idx].values, dtype=torch.long)
-
-        nonzero_mask = gids > 0
-        nonzero_indices = nonzero_mask.nonzero(as_tuple=True)[0]
-        nonzero_gids = gids[nonzero_indices]
-
-        if nonzero_gids.numel() == 0:
-            return torch.zeros(0, G, dtype=torch.long), torch.zeros(0, dtype=torch.long)
-
-        unique_gids, inverse, counts = torch.unique(
-            nonzero_gids, return_inverse=True, return_counts=True
-        )
-
-        # filter out groups exceeding max_group_size
-        valid = counts <= G
-        if valid.sum() == 0:
-            return torch.zeros(0, G, dtype=torch.long), torch.zeros(0, dtype=torch.long)
-
-        # keep only proteins belonging to valid groups
-        valid_per_protein = valid[inverse]
-        filtered_indices = nonzero_indices[valid_per_protein]
-        filtered_inverse = inverse[valid_per_protein]
-
-        # renumber groups contiguously
-        valid_old_ids = valid.nonzero(as_tuple=True)[0]
-        id_remap = torch.zeros(len(unique_gids), dtype=torch.long)
-        id_remap[valid_old_ids] = torch.arange(len(valid_old_ids))
-        new_inverse = id_remap[filtered_inverse]
-        new_counts = counts[valid]
-        n_positions = len(new_counts)
-
-        # sort by group to cluster members
-        sorted_order = new_inverse.argsort()
-        sorted_prot_indices = filtered_indices[sorted_order] + 1  # 1-based
-        sorted_bins = sample_bins[filtered_indices[sorted_order]]
-
-        # build padded position tensors
-        offsets = torch.zeros(n_positions + 1, dtype=torch.long)
-        offsets[1:] = new_counts.cumsum(0)
-
-        prot_ids = torch.zeros(n_positions, G, dtype=torch.long)
-        bins = torch.zeros(n_positions, dtype=torch.long)
-
-        for p in range(n_positions):
-            s = offsets[p].item()
-            n = new_counts[p].item()
-            prot_ids[p, :n] = sorted_prot_indices[s:s + n]
-            bins[p] = sorted_bins[s]
-
-        return prot_ids, bins
-
-    # ── group detection ─────────────────────────────────────────────────
-
-    def _detect_protein_groups(self):
-        """Detect protein groups by finding proteins with identical non-zero abundance values per sample.
-
-        Must be called BEFORE normalization since binning can merge unrelated proteins.
-        """
-        proteome_cols = self.data.select_dtypes(include="number").columns
-        vals = self.data[proteome_cols].values
-
-        group_ids = np.zeros(vals.shape, dtype=int)
-
-        for i in range(vals.shape[0]):
-            row = vals[i]
-            nonzero_mask = (row > 0) & ~np.isnan(row)
-            if not nonzero_mask.any():
-                continue
-
-            nonzero_vals = row[nonzero_mask]
-            nonzero_indices = np.where(nonzero_mask)[0]
-
-            val_to_gid = {}
-            gid = 1
-            for j, v in enumerate(nonzero_vals):
-                if v not in val_to_gid:
-                    val_to_gid[v] = gid
-                    gid += 1
-                group_ids[i, nonzero_indices[j]] = val_to_gid[v]
-
-        self.group_ids = pd.DataFrame(group_ids, index=self.data.index, columns=proteome_cols)
-
-        # log statistics
-        n_samples = vals.shape[0]
-        total_detected = 0
-        total_in_groups = 0
-        total_groups = 0
-        max_group_size_seen = 0
-        for i in range(n_samples):
-            gids_row = group_ids[i]
-            nonzero_gids = gids_row[gids_row > 0]
-            total_detected += len(nonzero_gids)
-            _, counts = np.unique(nonzero_gids, return_counts=True)
-            multi = counts > 1
-            total_in_groups += counts[multi].sum()
-            total_groups += multi.sum()
-            if len(counts) > 0:
-                max_group_size_seen = max(max_group_size_seen, counts.max())
-
-        avg_detected = total_detected / n_samples
-        avg_in_groups = total_in_groups / n_samples
-        avg_groups = total_groups / n_samples
-        pct = total_in_groups / total_detected * 100 if total_detected > 0 else 0
-        logging.info(f"Protein groups (per sample avg): {avg_in_groups:.0f}/{avg_detected:.0f} detected proteins "
-                     f"belong to a group ({pct:.1f}%), {avg_groups:.0f} groups, max group size={max_group_size_seen}")
-
-    # ── normalization & transposition ───────────────────────────────────
-
-    def normalize_dataset(self, bins=7):
-        proteome_cols = self.data.select_dtypes(include="number").columns
-        vals = self.data[proteome_cols].values.copy()
-
-        detected = (vals > 0) & ~np.isnan(vals)
-        result = np.zeros(vals.shape, dtype=int)
-
-        for i in range(vals.shape[0]):
-            mask = detected[i]
-            if mask.any():
-                row_vals = vals[i, mask]
-                n_detected = mask.sum()
-                order = np.argsort(row_vals)
-                ranks = np.empty_like(order)
-                ranks[order] = np.arange(1, n_detected + 1)
-                result[i, mask] = np.ceil(ranks / n_detected * bins).astype(int)
-
-        self.data[proteome_cols] = result
-
-        n_detected_avg = detected.sum(axis=1).mean()
-        logging.info(f"Avg detected proteins per sample: {n_detected_avg:.0f}/{len(proteome_cols)}")
-        logging.info(f"Binned dataset: 0=not detected, 1-{bins}=expression bins per sample.")
-
-    def transpose_data(self):
-        id_cols = self.data.select_dtypes(exclude="number").columns.tolist()
-        sample_ids = self.data[id_cols].astype(str).agg('_'.join, axis=1)
-        self.data = self.data.drop(columns=id_cols)
-        sorted_cols = sorted(self.data.columns)
-        self.data = self.data[sorted_cols]
-        self.data.index = sample_ids
-        self.data.index.name = 'sample_id'
-        self.data = self.data.transpose()
-
-        if self.detect_groups:
-            self.group_ids = self.group_ids[sorted_cols]
-            self.group_ids.index = sample_ids
-            self.group_ids.index.name = 'sample_id'
-            self.group_ids = self.group_ids.transpose()
+def _index_dtype_for(n_var: int):
+    """Smallest unsigned int dtype that indexes n_var columns."""
+    return np.uint16 if n_var <= np.iinfo(np.uint16).max else np.uint32
 
 
-class TranscriptomicsDataset(Dataset):
-    """Dataset for single-cell transcriptomics data stored as sparse CSR matrix.
+def _segmented_bins(vals: np.ndarray, lengths: np.ndarray, num_bins: int) -> np.ndarray:
+    """Vectorized rank-based binning of many samples at once.
 
-    Loads expression.npz + metadata + protein_columns from build_sc_dataset.py output.
-    Row range selects the split (train/valid/test) from the ordered matrix.
+    `vals` is the concatenation of every sample's detected values in a block;
+    `lengths` gives each sample's count. Returns a uint8 array (same length as
+    `vals`) of bins in 1..num_bins, where each sample is binned independently by
+    within-sample value rank.
 
-    Cache is stored as memory-mapped numpy arrays with compact dtypes (int16 for
-    protein IDs, uint8 for bins) in a directory alongside the .npz file. This avoids
-    loading the full dataset into RAM — only pages touched by the current batch are
-    resident in memory.
+    Equivalent to running, per sample,
+        order = argsort(v, kind="stable"); ranks[order] = arange(1, n+1)
+        bins  = ceil(ranks / n * num_bins)
+    but as a single segmented sort over the whole block. A stable lexsort by
+    (sample, value) reproduces the per-sample stable argsort exactly (ties keep
+    original order), so the output matches per-row normalization but faster.
+    """
+    n = len(vals)
+    if n == 0:
+        return np.zeros(0, dtype=np.uint8)
+    n_rows = len(lengths)
+    rows = np.repeat(np.arange(n_rows), lengths)          # sample id per element
+    starts = np.zeros(n_rows, dtype=np.int64)             # block-local row offsets
+    np.cumsum(lengths[:-1], out=starts[1:])
 
-    Produces the same (exp_prot_ids, exp_bins[, absent_ids]) interface as ProteomeDataset.
+    order = np.lexsort((vals, rows))                      # stable: by sample, then value
+    within = np.arange(n) - starts[rows[order]]           # 0-based rank within its sample
+    ranks = np.empty(n, dtype=np.int64)
+    ranks[order] = within + 1                             # scatter back to original order
+
+    row_len = lengths[rows].astype(np.float64)
+    return np.ceil(ranks / row_len * num_bins).astype(np.uint8)
+
+
+def _split_row_groups(ids: np.ndarray, bins: np.ndarray, vals: np.ndarray,
+                      max_group_size: int):
+    """Split one sample's detected proteins into individuals + groups.
+
+    `ids` (1-based) and `bins` are precomputed; `vals` are the raw abundances used
+    for group detection. Returns (ind_ids, ind_bins, groups) where groups is a list
+    of (member_ids, group_bin). Group detection collapses proteins with identical
+    RAW values; groups larger than max_group_size are dropped (legacy `counts <= G`).
+    """
+    uniq, inv, counts = np.unique(vals, return_inverse=True, return_counts=True)
+    count_per_protein = counts[inv]
+    is_ind = count_per_protein == 1
+    ind_ids, ind_bins = ids[is_ind], bins[is_ind]
+
+    groups = []
+    if max_group_size >= 2:
+        valid_vals = np.nonzero((counts >= 2) & (counts <= max_group_size))[0]
+        for u in valid_vals:
+            mask = inv == u
+            members = ids[mask]
+            group_bin = bins[mask][0]  # group shares one value → first member's bin
+            groups.append((members, int(group_bin)))
+    return ind_ids, ind_bins, groups
+
+
+# ── dataset ──────────────────────────────────────────────────────────────────
+
+class ExpressionDataset(Dataset):
+    """Unified dataset over a `.h5ad` source for proteomics or transcriptomics.
+
+    Args:
+        h5ad_path: path to the source `.h5ad` (raw values, var_names = accessions).
+        num_bins: number of expression bins (rank-based, per sample).
+        detect_groups: collapse proteins with identical raw abundance into groups
+            (proteomics only). max_group_size bounds / filters group size.
+        max_group_size: groups larger than this are dropped; 1 disables grouping.
+        cache_dir: where to put the derived cache (default: alongside the h5ad).
+        ram_fraction: load the cache fully into RAM if it fits within this fraction
+            of currently-available RAM; otherwise memory-map it.
     """
 
-    _CACHE_VERSION = 2  # bump when cache format changes
-
-    def __init__(self, expression_path, protein_columns_path,
-                 num_bins=10, cache_path=None, include_absent=False):
-        self.include_absent = include_absent
+    def __init__(self, h5ad_path, num_bins=10, detect_groups=False, max_group_size=1,
+                 cache_dir=None, ram_fraction=0.5):
+        self.h5ad_path = str(h5ad_path)
         self.num_bins = num_bins
+        self.detect_groups = detect_groups
+        self.max_group_size = max_group_size if detect_groups else 1
+        self.ram_fraction = ram_fraction
 
-        # Load protein column names
-        with open(protein_columns_path) as f:
-            self.protein_columns = json.load(f)
-        self._n_proteins = len(self.protein_columns)
+        self._read_source()  
 
-        # Try loading memory-mapped cache first (avoids loading the sparse matrix)
-        if cache_path and self._try_load_mmap_cache(cache_path):
-            return
+        cache_dir = cache_dir or self._default_cache_dir()
+        if not self._try_load_cache(cache_dir):
+            self._build_cache(cache_dir)
+            assert self._try_load_cache(cache_dir), "cache build did not produce a loadable cache"
 
-        # Cache miss — load sparse matrix and build cache
-        from scipy.sparse import load_npz
-        logging.info(f"Loading {expression_path}...")
-        self.X = load_npz(expression_path)
-        self._n_samples = self.X.shape[0]
-        logging.info(f"  Loaded: {self._n_samples:,} cells × {self.X.shape[1]:,} proteins, "
-                     f"nnz={self.X.nnz:,}")
+    # -- source ---------------------------------------------------------------
 
-        # Normalize (rank-based binning per row on sparse data)
-        self._normalize_sparse(num_bins)
+    def _read_source(self):
+        adata = ad.read_h5ad(self.h5ad_path, backed="r")
+        self.feature_names = list(adata.var_names)   # accessions, index order
+        self.sample_ids = list(adata.obs_names)
+        self.obs = adata.obs.copy()
+        self.var = adata.var.copy()
+        self.modality = adata.uns.get("modality", "unknown")
+        self._n_features = len(self.feature_names)
+        self._n_samples = adata.n_obs
+        if adata.isbacked:
+            adata.file.close()
 
-        # Build packed arrays and save as mmap cache
-        self._build_and_save_mmap_cache(cache_path)
-
-    def __getitem__(self, idx):
-        """Return per-sample data sliced from mmap'd arrays, converted to torch."""
-        start = self._offsets[idx]
-        end = self._offsets[idx + 1]
-        prot_ids = torch.as_tensor(self._all_prot_ids[start:end].astype(np.int64)).unsqueeze(1)
-        bins = torch.as_tensor(self._all_bins[start:end].astype(np.int64))
-
-        if self.include_absent:
-            abs_start = self._abs_offsets[idx]
-            abs_end = self._abs_offsets[idx + 1]
-            absent = torch.as_tensor(self._all_absent_ids[abs_start:abs_end].astype(np.int64))
-            return prot_ids, bins, absent
-        return prot_ids, bins
+    def num_features(self):
+        return self._n_features
 
     def __len__(self):
         return self._n_samples
 
-    def num_proteins(self):
-        return self._n_proteins
+    # -- cache keying ---------------------------------------------------------
 
-    def _normalize_sparse(self, num_bins):
-        """Rank-based binning per row, operating on sparse CSR. Stores result as list of (indices, bins)."""
-        logging.info(f"Binning {self.X.shape[0]:,} cells into {num_bins} expression bins...")
-        self._binned_rows = []
+    def _var_names_hash(self):
+        "serves as the cache fingerprint to evaluate if the same h5ad source was used to make it"
+        h = hashlib.sha1()
+        for name in self.feature_names:
+            h.update(name.encode())
+            h.update(b"\0")
+        return h.hexdigest()[:16]
 
-        for i in tqdm(range(self.X.shape[0]), desc="Binning cells"):
-            row = self.X.getrow(i)
-            if row.nnz == 0:
-                self._binned_rows.append((np.array([], dtype=np.int16), np.array([], dtype=np.uint8)))
-                continue
+    def _cache_tag(self):
+        return f"bins{self.num_bins}_grp{int(self.detect_groups)}x{self.max_group_size}"
 
-            col_indices = row.indices
-            values = row.data
+    def _default_cache_dir(self):
+        stem = os.path.splitext(os.path.basename(self.h5ad_path))[0]
+        parent = os.path.dirname(self.h5ad_path) or "."
+        return os.path.join(parent, f"cache_{stem}_{self._cache_tag()}")
 
-            order = np.argsort(values)
-            ranks = np.empty_like(order)
-            ranks[order] = np.arange(1, len(values) + 1)
-            bins = np.ceil(ranks / len(values) * num_bins).astype(np.uint8)
+    def _expected_meta(self):
+        return {
+            "cache_version": CACHE_VERSION,
+            "n_samples": self._n_samples,
+            "n_features": self._n_features,
+            "num_bins": self.num_bins,
+            "detect_groups": self.detect_groups,
+            "max_group_size": self.max_group_size,
+            "var_names_hash": self._var_names_hash(),
+        }
 
-            self._binned_rows.append((col_indices.astype(np.int16), bins))
+    # -- cache load -----------------------------------------------------------
 
-        n_proteins = self.X.shape[1]
-        del self.X
-        self.X = None
-
-        avg_detected = np.mean([len(r[0]) for r in self._binned_rows])
-        logging.info(f"  Avg detected proteins per cell: {avg_detected:.0f}/{n_proteins}")
-
-    def _try_load_mmap_cache(self, cache_path):
-        """Attempt to load memory-mapped cache directory. Returns True on success."""
-        cache_dir = self._cache_dir(cache_path)
+    def _try_load_cache(self, cache_dir):
         meta_path = os.path.join(cache_dir, "meta.json")
         if not os.path.exists(meta_path):
             return False
-
         with open(meta_path) as f:
             meta = json.load(f)
-
-        if (meta.get("version") != self._CACHE_VERSION
-                or meta.get("n_proteins") != self._n_proteins
-                or meta.get("include_absent") != self.include_absent
-                or meta.get("num_bins") != self.num_bins):
-            logging.info(f"  Cache mismatch at {cache_dir}, recomputing...")
+        if meta != self._expected_meta():
+            log.info(f"  Cache mismatch at {cache_dir}, will rebuild")
             return False
 
-        self._n_samples = meta["n_samples"]
+        total_bytes = sum(
+            os.path.getsize(os.path.join(cache_dir, fn))
+            for fn in os.listdir(cache_dir) if fn.endswith(".npy")
+        )
+        mmap = self._should_mmap(total_bytes)
+        mode = "r" if mmap else None
 
-        # Offsets are small (~32MB for 4M samples) — load into RAM for fast indexing
-        self._offsets = np.load(os.path.join(cache_dir, "offsets.npy"))
-        # Packed arrays are memory-mapped — only accessed pages enter RAM
-        self._all_prot_ids = np.load(os.path.join(cache_dir, "prot_ids.npy"), mmap_mode="r")
-        self._all_bins = np.load(os.path.join(cache_dir, "bins.npy"), mmap_mode="r")
+        def load(name):
+            return np.load(os.path.join(cache_dir, name), mmap_mode=mode)
 
-        if self.include_absent:
-            self._abs_offsets = np.load(os.path.join(cache_dir, "abs_offsets.npy"))
-            self._all_absent_ids = np.load(os.path.join(cache_dir, "abs_ids.npy"), mmap_mode="r")
+        self.ind_feature_ids = load("ind_feature_ids.npy")
+        self.ind_bins = load("ind_bins.npy")
+        self.ind_offsets = np.asarray(load("ind_offsets.npy"))  # offsets always in RAM
 
-        total = self._offsets[-1]
-        logging.info(f"  Loaded mmap cache: {self._n_samples:,} samples, "
-                     f"{total:,} entries ({cache_dir})")
+        if self.detect_groups:
+            self.grp_members = load("grp_members.npy")
+            self.grp_member_offsets = np.asarray(load("grp_member_offsets.npy"))
+            self.grp_bins = load("grp_bins.npy")
+            self.grp_offsets = np.asarray(load("grp_offsets.npy"))
+
+        log.info(f"  Loaded cache ({'mmap' if mmap else 'RAM'}, "
+                 f"{total_bytes / 1e6:.0f} MB) from {cache_dir}")
         return True
 
-    def _build_and_save_mmap_cache(self, cache_path):
-        """Build packed arrays from binned rows and save as memory-mapped .npy files."""
-        n_samples = len(self._binned_rows)
+    def _should_mmap(self, total_bytes):
+        try:
+            import psutil
+            available = psutil.virtual_memory().available
+        except Exception:
+            return total_bytes > 2 * 1024**3  # no psutil → mmap anything over 2 GB
+        return total_bytes > self.ram_fraction * available
 
-        # First pass: compute total sizes for pre-allocation
-        det_sizes = np.array([len(r[0]) for r in self._binned_rows], dtype=np.int64)
-        offsets = np.zeros(n_samples + 1, dtype=np.int64)
-        np.cumsum(det_sizes, out=offsets[1:])
-        total_detected = offsets[-1]
+    # -- cache build (streaming over the h5ad) --------------------------------
 
-        if self.include_absent:
-            abs_sizes = np.array([self._n_proteins - s for s in det_sizes], dtype=np.int64)
-            abs_offsets = np.zeros(n_samples + 1, dtype=np.int64)
-            np.cumsum(abs_sizes, out=abs_offsets[1:])
-            total_absent = abs_offsets[-1]
+    def _build_cache(self, cache_dir):
+        import h5py
 
-        # Pre-allocate packed arrays with compact dtypes
-        all_prot_ids = np.empty(total_detected, dtype=np.int16)
-        all_bins = np.empty(total_detected, dtype=np.uint8)
-        if self.include_absent:
-            all_absent_ids = np.empty(total_absent, dtype=np.int16)
+        log.info(f"Building cache for {self.h5ad_path} ({self._cache_tag()}) ...")
+        os.makedirs(cache_dir, exist_ok=True)
+        idx_dtype = _index_dtype_for(self._n_features)
 
-        # Second pass: fill packed arrays
-        for idx in tqdm(range(n_samples), desc="Packing SC positions"):
-            col_indices, bins = self._binned_rows[idx]
-            start = offsets[idx]
-            end = offsets[idx + 1]
-            all_prot_ids[start:end] = col_indices + 1   # 1-based IDs
-            all_bins[start:end] = bins
+        ind_ids_parts, ind_bin_parts, ind_lens = [], [], []
+        grp_member_parts, grp_size_parts, grp_bin_parts, grp_counts = [], [], [], []
 
-            if self.include_absent:
-                detected = set(col_indices.tolist())
-                absent = np.array([p + 1 for p in range(self._n_proteins) if p not in detected], dtype=np.int16)
-                abs_start = abs_offsets[idx]
-                all_absent_ids[abs_start:abs_start + len(absent)] = absent
+        with h5py.File(self.h5ad_path, "r") as f:
+            Xg = f["X"]
+            assert Xg.attrs.get("encoding-type") == "csr_matrix", "X must be CSR"
+            indptr = Xg["indptr"][:]
+            data_ds, idx_ds = Xg["data"], Xg["indices"]
+            n = self._n_samples
 
-        self._binned_rows = None
-        logging.info(f"Packed {n_samples:,} samples → {total_detected:,} detected entries")
+            for r0 in tqdm(range(0, n, _BUILD_BLOCK), desc="Building cache"):
+                r1 = min(r0 + _BUILD_BLOCK, n)
+                s, e = int(indptr[r0]), int(indptr[r1])
+                block_data = data_ds[s:e]
+                block_idx = idx_ds[s:e]
+                lengths = (indptr[r0 + 1:r1 + 1] - indptr[r0:r1]).astype(np.int64)
 
-        # Save to mmap cache directory
-        if cache_path:
-            cache_dir = self._cache_dir(cache_path)
-            os.makedirs(cache_dir, exist_ok=True)
+                # binning is vectorized across the whole block (both modalities)
+                bins_block = _segmented_bins(block_data, lengths, self.num_bins)
+                ids_block = (block_idx.astype(np.int64) + 1).astype(idx_dtype, copy=False)
 
-            np.save(os.path.join(cache_dir, "prot_ids.npy"), all_prot_ids)
-            np.save(os.path.join(cache_dir, "bins.npy"), all_bins)
-            np.save(os.path.join(cache_dir, "offsets.npy"), offsets)
-            if self.include_absent:
-                np.save(os.path.join(cache_dir, "abs_ids.npy"), all_absent_ids)
-                np.save(os.path.join(cache_dir, "abs_offsets.npy"), abs_offsets)
+                if not self.detect_groups:
+                    # every detected protein is an individual — no per-row work
+                    ind_ids_parts.append(ids_block)
+                    ind_bin_parts.append(bins_block)
+                    ind_lens.extend(lengths.tolist())
+                    continue
 
-            meta = {
-                "version": self._CACHE_VERSION,
-                "n_samples": n_samples,
-                "n_proteins": self._n_proteins,
-                "include_absent": self.include_absent,
-                "num_bins": self.num_bins,
-            }
-            with open(os.path.join(cache_dir, "meta.json"), "w") as f:
-                json.dump(meta, f)
-            logging.info(f"  Saved mmap cache to {cache_dir}")
+                # groups: per-row formation (proteomics only), reusing block bins/ids
+                local_starts = np.zeros(len(lengths) + 1, dtype=np.int64)
+                np.cumsum(lengths, out=local_starts[1:])
+                for j in range(len(lengths)):
+                    a, b = int(local_starts[j]), int(local_starts[j + 1])
+                    ind_ids, ind_bins, groups = _split_row_groups(
+                        ids_block[a:b], bins_block[a:b], block_data[a:b], self.max_group_size,
+                    )
+                    ind_ids_parts.append(ind_ids)
+                    ind_bin_parts.append(ind_bins)
+                    ind_lens.append(len(ind_ids))
+                    grp_counts.append(len(groups))
+                    for members, gbin in groups:
+                        grp_member_parts.append(members.astype(idx_dtype, copy=False))
+                        grp_size_parts.append(len(members))
+                        grp_bin_parts.append(gbin)
 
-            # Re-open as mmap so training uses the memory-mapped path
-            self._offsets = offsets
-            self._all_prot_ids = np.load(os.path.join(cache_dir, "prot_ids.npy"), mmap_mode="r")
-            self._all_bins = np.load(os.path.join(cache_dir, "bins.npy"), mmap_mode="r")
-            if self.include_absent:
-                self._abs_offsets = abs_offsets
-                self._all_absent_ids = np.load(os.path.join(cache_dir, "abs_ids.npy"), mmap_mode="r")
-        else:
-            # No cache path — keep in RAM (still benefits from compact dtypes)
-            self._offsets = offsets
-            self._all_prot_ids = all_prot_ids
-            self._all_bins = all_bins
-            if self.include_absent:
-                self._abs_offsets = abs_offsets
-                self._all_absent_ids = all_absent_ids
+        self._save_packed(cache_dir, idx_dtype, ind_ids_parts, ind_bin_parts, ind_lens,
+                          grp_member_parts, grp_size_parts, grp_bin_parts, grp_counts)
 
-        self._n_samples = n_samples
+        with open(os.path.join(cache_dir, "meta.json"), "w") as f:
+            json.dump(self._expected_meta(), f, indent=2)
+        log.info(f"  Saved cache to {cache_dir}")
 
-    @staticmethod
-    def _cache_dir(cache_path):
-        """Convert legacy .pt cache path to mmap directory path."""
-        if cache_path.endswith(".pt"):
-            return cache_path[:-3]  # train_cache.pt → train_cache
-        return cache_path
+    def _save_packed(self, cache_dir, idx_dtype, ind_ids_parts, ind_bin_parts, ind_lens,
+                     grp_member_parts, grp_size_parts, grp_bin_parts, grp_counts):
+        def save(name, arr):
+            np.save(os.path.join(cache_dir, name), arr)
+
+        ind_ids = (np.concatenate(ind_ids_parts) if ind_ids_parts
+                   else np.zeros(0, idx_dtype))
+        ind_bins = (np.concatenate(ind_bin_parts) if ind_bin_parts
+                    else np.zeros(0, np.uint8))
+        ind_offsets = np.zeros(len(ind_lens) + 1, dtype=np.int64)
+        np.cumsum(np.asarray(ind_lens, dtype=np.int64), out=ind_offsets[1:])
+        save("ind_feature_ids.npy", ind_ids.astype(idx_dtype, copy=False))
+        save("ind_bins.npy", ind_bins.astype(np.uint8, copy=False))
+        save("ind_offsets.npy", ind_offsets)
+
+        if self.detect_groups:
+            grp_members = (np.concatenate(grp_member_parts) if grp_member_parts
+                           else np.zeros(0, idx_dtype))
+            grp_member_offsets = np.zeros(len(grp_size_parts) + 1, dtype=np.int64)
+            np.cumsum(np.asarray(grp_size_parts, dtype=np.int64), out=grp_member_offsets[1:])
+            grp_bins = np.asarray(grp_bin_parts, dtype=np.uint8)
+            grp_offsets = np.zeros(len(grp_counts) + 1, dtype=np.int64)
+            np.cumsum(np.asarray(grp_counts, dtype=np.int64), out=grp_offsets[1:])
+            save("grp_members.npy", grp_members.astype(idx_dtype, copy=False))
+            save("grp_member_offsets.npy", grp_member_offsets)
+            save("grp_bins.npy", grp_bins)
+            save("grp_offsets.npy", grp_offsets)
+
+    # -- item access ----------------------------------------------------------
+
+    def __getitem__(self, idx):
+        """Return one sample's data by slicing the flat cache arrays.
+
+        Mental model — "parallel arrays + offset rulers":
+          * Values live in flat, positionally-aligned arrays
+          * Offset arrays hold no data — they are rulers marking where each thing's
+            slice begins.
+
+        Individuals need one ruler (sample -> its individuals: ind_offsets).
+        Groups need two stacked rulers, since there are two levels of "many":
+          grp_offsets         : sample -> its groups
+          grp_member_offsets  : group  -> its members
+        ``grp_members`` is every group's members concatenated end-to-end across all
+        groups; ``grp_sizes`` (consecutive member-offset diffs) tells the collator
+        where one group stops and the next begins; ``grp_bins`` is one bin per group.
+        """
+        a, b = int(self.ind_offsets[idx]), int(self.ind_offsets[idx + 1])
+        item = {
+            "ind_ids": torch.as_tensor(np.asarray(self.ind_feature_ids[a:b], dtype=np.int64)),
+            "ind_bins": torch.as_tensor(np.asarray(self.ind_bins[a:b], dtype=np.int64)),
+        }
+        if self.detect_groups:
+            g0, g1 = int(self.grp_offsets[idx]), int(self.grp_offsets[idx + 1]) 
+            if g1 > g0: # does this sample have any groups?
+                m0 = int(self.grp_member_offsets[g0])
+                m1 = int(self.grp_member_offsets[g1])
+                sizes = (self.grp_member_offsets[g0 + 1:g1 + 1]
+                         - self.grp_member_offsets[g0:g1])
+                item["grp_members"] = torch.as_tensor(
+                    np.asarray(self.grp_members[m0:m1], dtype=np.int64))
+                item["grp_sizes"] = torch.as_tensor(np.asarray(sizes, dtype=np.int64))
+                item["grp_bins"] = torch.as_tensor(
+                    np.asarray(self.grp_bins[g0:g1], dtype=np.int64))
+            else:
+                item["grp_members"] = torch.zeros(0, dtype=torch.long)
+                item["grp_sizes"] = torch.zeros(0, dtype=torch.long)
+                item["grp_bins"] = torch.zeros(0, dtype=torch.long)
+        return item
 
 
-class ProteomeCollator:
-    """Collate proteome samples into batched tensors for the transformer.
+# ── collator ───────────────────────────────────────────────────────────────
 
-    Receives precomputed (prot_ids, bins) per sample, subsamples into fixed-size
-    segments for individuals, protein groups, and absent proteins.
+class ExpressionCollator:
+    """Collate samples into the model's batched sequence tensors.
 
-    Sequence layout: [PST, ind_ctx/tgt, PAD..., grp_ctx/tgt, PAD..., abs_ctx/tgt, PAD...]
+    Sequence layout: [PST, individuals…PAD, groups…PAD, absent…PAD].
+    Individuals / groups / absent each have their own budget and context ratio.
+    Groups are padded to the **batch-local** max group size; absent species are
+    sampled on the fly from proteins not detected in the sample.
 
-    Returns dict with tensors:
+    Returns dict:
         role         (B, S):    0=padding, 1=context/PST, 2=target
-        protein_ids  (B, S, G): protein IDs per position (G=max_group_size)
+        feature_ids  (B, S, G): protein ids per position (G = batch-local max group size)
         bin_values   (B, S):    expression bins
         group_sizes  (B, S):    members per position (only when protein_groups_enabled)
     """
 
-    def __init__(self, protein_context_ratio: float = 0.85, group_context_ratio: float = 1.0,
-                 input_proteins: int = 1024, protein_groups_enabled: bool = False,
-                 max_group_size: int = 1, input_groups: int = 0,
+    def __init__(self, num_features: int, feature_context_ratio: float = 0.85,
+                 group_context_ratio: float = 1.0, input_features: int = 1024,
+                 protein_groups_enabled: bool = False, input_groups: int = 0,
                  absent_species_enabled: bool = False, input_absent: int = 0,
                  absent_context_ratio: float = 1.0):
-        self.protein_context_ratio = protein_context_ratio
+        self.num_features = num_features
+        self.feature_context_ratio = feature_context_ratio
         self.group_context_ratio = group_context_ratio
-        self.input_proteins = input_proteins
+        self.input_features = input_features
         self.protein_groups_enabled = protein_groups_enabled
-        self.max_group_size = max_group_size if protein_groups_enabled else 1
         self.input_groups = input_groups if protein_groups_enabled else 0
         self.absent_species_enabled = absent_species_enabled
         self.input_absent = input_absent if absent_species_enabled else 0
         self.absent_context_ratio = absent_context_ratio
 
     def __call__(self, batch):
-        n_batches = len(batch)
-        G = self.max_group_size
-        n_input = 1 + self.input_proteins + self.input_groups + self.input_absent
+        B = len(batch)
 
-        role        = torch.zeros(n_batches, n_input, dtype=torch.long)
-        protein_ids = torch.zeros(n_batches, n_input, G, dtype=torch.long)
-        bin_values  = torch.zeros(n_batches, n_input, dtype=torch.long)
-        group_sizes = torch.zeros(n_batches, n_input, dtype=torch.long)
+        # 1) per-sample subsampling (done first so we know the batch-local group width)
+        prepared = [self._prepare_sample(s) for s in batch]
+        G = 1
+        for p in prepared:
+            if p["g_sizes"].numel() > 0:
+                G = max(G, int(p["g_sizes"].max()))
+        S = 1 + self.input_features + self.input_groups + self.input_absent
 
-        for i, sample in enumerate(batch):
-            # unpack: (exp_prot_ids, exp_bins) or (exp_prot_ids, exp_bins, absent_ids)
-            if len(sample) == 3:
-                exp_prot_ids, exp_bins, absent_ids = sample
-            else:
-                exp_prot_ids, exp_bins = sample
-                absent_ids = None
+        role = torch.zeros(B, S, dtype=torch.long)
+        feature_ids = torch.zeros(B, S, G, dtype=torch.long)
+        bin_values = torch.zeros(B, S, dtype=torch.long)
+        group_sizes = torch.zeros(B, S, dtype=torch.long)
 
-            # derive group sizes: count non-zero members per position
-            sample_group_sizes = (exp_prot_ids > 0).sum(dim=1)  # (n_positions,)
+        grp_seg = 1 + self.input_features
+        abs_seg = grp_seg + self.input_groups
 
-            # separate individuals (size==1) from groups (size>1)
-            is_ind = sample_group_sizes == 1
-            is_grp = sample_group_sizes > 1
+        for i, p in enumerate(prepared):
+            role[i, 0] = 1  # PST
 
-            ind_ids, ind_bins = exp_prot_ids[is_ind], exp_bins[is_ind]
-            grp_ids, grp_bins, grp_sizes_sel = exp_prot_ids[is_grp], exp_bins[is_grp], sample_group_sizes[is_grp]
-
-            n_ind = len(ind_bins)
-            n_grp = len(grp_bins)
-
-
-            # subsample individuals
-            if n_ind > self.input_proteins:
-                sel = torch.randperm(n_ind)[:self.input_proteins]
-                ind_ids, ind_bins = ind_ids[sel], ind_bins[sel]
-                n_ind = self.input_proteins
-
-            # subsample groups
-            if self.input_groups > 0 and n_grp > self.input_groups:
-                sel = torch.randperm(n_grp)[:self.input_groups]
-                grp_ids, grp_bins, grp_sizes_sel = grp_ids[sel], grp_bins[sel], grp_sizes_sel[sel]
-                n_grp = self.input_groups
-            elif self.input_groups == 0:
-                n_grp = 0
-
-            if n_ind + n_grp < 2 and (absent_ids is None or self.input_absent == 0):
-                continue
-
-            # subsample absent proteins
-            n_abs = 0
-            if absent_ids is not None and self.input_absent > 0 and len(absent_ids) > 0:
-                n_abs = min(self.input_absent, len(absent_ids))
-                sel = torch.randperm(len(absent_ids))[:n_abs]
-                abs_ids_sampled = absent_ids[sel]
-
-            # PST at position 0
-            role[i, 0] = 1
-
-
-            # individual segment: [1, 1+n_ind) 
+            # individuals (width 1)
+            n_ind = len(p["ind_ids"])
             if n_ind > 0:
-                perm = torch.randperm(n_ind)
-                n_ctx = max(1, int(n_ind * self.protein_context_ratio))
                 pos = torch.arange(1, 1 + n_ind)
-
+                n_ctx = max(1, int(n_ind * self.feature_context_ratio))
                 role[i, pos[:n_ctx]] = 1
                 role[i, pos[n_ctx:]] = 2
-                bin_values[i, pos]   = ind_bins[perm]
-                group_sizes[i, pos]  = 1
-                protein_ids[i, pos]  = ind_ids[perm]
+                feature_ids[i, pos, 0] = p["ind_ids"]
+                bin_values[i, pos] = p["ind_bins"]
+                group_sizes[i, pos] = 1
 
-            # group segment: [1+input_proteins, 1+input_proteins+n_grp) 
+            # groups (members scattered via precomputed slot/col indices — no loop)
+            n_grp = p["g_sizes"].numel()
             if n_grp > 0:
-                perm = torch.randperm(n_grp)
+                pos = torch.arange(grp_seg, grp_seg + n_grp)
                 n_ctx = max(1, int(n_grp * self.group_context_ratio))
-                offset = 1 + self.input_proteins
-                pos = torch.arange(offset, offset + n_grp)
-
                 role[i, pos[:n_ctx]] = 1
                 role[i, pos[n_ctx:]] = 2
-                bin_values[i, pos]   = grp_bins[perm]
-                group_sizes[i, pos]  = grp_sizes_sel[perm]
-                protein_ids[i, pos]  = grp_ids[perm]
+                bin_values[i, pos] = p["g_bins"]
+                group_sizes[i, pos] = p["g_sizes"]
+                feature_ids[i, grp_seg + p["g_seg"], p["g_col"]] = p["g_members"]
 
-            # absent segment: [1+input_proteins+input_groups, ...)
+            # absent (width 1, bin stays 0 = not detected)
+            n_abs = len(p["abs_ids"])
             if n_abs > 0:
-                perm = torch.randperm(n_abs)
+                pos = torch.arange(abs_seg, abs_seg + n_abs)
                 n_ctx = int(n_abs * self.absent_context_ratio)
-                offset = 1 + self.input_proteins + self.input_groups
-                pos = torch.arange(offset, offset + n_abs)
-
                 if n_ctx > 0:
                     role[i, pos[:n_ctx]] = 1
                 role[i, pos[n_ctx:]] = 2
-                protein_ids[i, pos, 0] = abs_ids_sampled[perm]  # already 1-based
+                feature_ids[i, pos, 0] = p["abs_ids"]
                 group_sizes[i, pos] = 1
 
-        result = {"role": role, "protein_ids": protein_ids, "bin_values": bin_values}
+        result = {"role": role, "feature_ids": feature_ids, "bin_values": bin_values}
         if self.protein_groups_enabled:
             result["group_sizes"] = group_sizes
-            
         return result
+
+    def _prepare_sample(self, sample):
+        """Subsample one sample's individuals / groups and draw absent species."""
+        ind_ids, ind_bins = sample["ind_ids"], sample["ind_bins"]
+        n_ind = len(ind_ids)
+        if n_ind > self.input_features:
+            sel = torch.randperm(n_ind)[:self.input_features]
+            ind_ids, ind_bins = ind_ids[sel], ind_bins[sel]
+        else:
+            perm = torch.randperm(n_ind)
+            ind_ids, ind_bins = ind_ids[perm], ind_bins[perm]
+
+        # groups: select up to input_groups whole groups and gather their members
+        # vectorized (no per-group Python loop). g_seg/g_col give each member's
+        # (slot, column) so __call__ can scatter them in one indexed assignment.
+        g_members = torch.zeros(0, dtype=torch.long)
+        g_sizes = torch.zeros(0, dtype=torch.long)
+        g_bins = torch.zeros(0, dtype=torch.long)
+        g_seg = torch.zeros(0, dtype=torch.long)
+        g_col = torch.zeros(0, dtype=torch.long)
+        if self.input_groups > 0 and "grp_sizes" in sample and sample["grp_sizes"].numel() > 0:
+            sizes = sample["grp_sizes"]
+            members_flat = sample["grp_members"]
+            n_grp = sizes.numel()
+            order = torch.randperm(n_grp)[:self.input_groups]
+            off = torch.zeros(n_grp + 1, dtype=torch.long)
+            torch.cumsum(sizes, dim=0, out=off[1:])
+            sel_sizes = sizes[order]
+            sel_starts = off[order]                                  # start of each group in members_flat
+            k = order.numel()
+            g_seg = torch.repeat_interleave(torch.arange(k), sel_sizes)   # slot (group) per member
+            sel_off = torch.zeros(k + 1, dtype=torch.long)
+            torch.cumsum(sel_sizes, dim=0, out=sel_off[1:])
+            g_col = torch.arange(int(sel_off[-1])) - sel_off[g_seg]       # column within group
+            g_members = members_flat[sel_starts[g_seg] + g_col]          # gathered members
+            g_sizes = sel_sizes
+            g_bins = sample["grp_bins"][order]
+
+        abs_ids = torch.zeros(0, dtype=torch.long)
+        if self.input_absent > 0:
+            detected = ind_ids if g_members.numel() == 0 else torch.cat([ind_ids, g_members])
+            abs_ids = self._sample_absent(detected)
+
+        return {
+            "ind_ids": ind_ids, "ind_bins": ind_bins,
+            "g_members": g_members, "g_sizes": g_sizes, "g_bins": g_bins,
+            "g_seg": g_seg, "g_col": g_col, "abs_ids": abs_ids,
+        }
+
+    def _sample_absent(self, detected_ids):
+        """Sample `input_absent` protein ids (1-based) not detected in this sample."""
+        k = self.input_absent
+        detected = set(detected_ids.tolist())
+        # rejection sampling, repeatedly sample random ids util we have k that where not detected
+        # cap the number of tries to avoid infinite loops
+        out, tries = [], 0
+        max_tries = k * 20 + 100
+        while len(out) < k and tries < max_tries:
+            cand = int(torch.randint(1, self.num_features + 1, (1,)).item())
+            if cand not in detected:
+                out.append(cand)
+                detected.add(cand)
+            tries += 1
+        return torch.tensor(out, dtype=torch.long)

@@ -20,8 +20,7 @@ from sklearn.manifold import TSNE
 from tqdm import tqdm
 
 from protgpt.architecture import ProtGPT
-from protgpt.data import ProteomeCollator, ProteomeDataset
-from protgpt.train import load_dataset
+from protgpt.data import ExpressionCollator, ExpressionDataset
 
 log = logging.getLogger(__name__)
 
@@ -38,7 +37,7 @@ def _build_model_cfg(cfg: dict) -> dict:
     """Extract model config dict from a checkpoint config."""
     mcfg = cfg["model"]
     model_cfg = {
-        "num_proteins": None,  # set by caller
+        "num_features": None,  # set by caller
         "num_bins":     cfg["data"]["num_bins"],
         "d_model":      mcfg["d_model"],
         "n_heads":      mcfg["n_heads"],
@@ -72,9 +71,9 @@ def _load_model(checkpoint_path: str, device: str = "cuda" if torch.cuda.is_avai
     esmc_lookup = None
     if model_cfg["use_esmc"]:
         esmc_lookup = ckpt["model"]["esmc_embedding.weight"]
-        model_cfg["num_proteins"] = esmc_lookup.shape[0] - 1
+        model_cfg["num_features"] = esmc_lookup.shape[0] - 1
     else:
-        model_cfg["num_proteins"] = ckpt["model"]["protein_emb.weight"].shape[0] - 1
+        model_cfg["num_features"] = ckpt["model"]["feature_emb.weight"].shape[0] - 1
 
     model = ProtGPT(model_cfg, esmc_lookup=esmc_lookup)
     model.load_state_dict(ckpt["model"])
@@ -87,7 +86,7 @@ def _load_model(checkpoint_path: str, device: str = "cuda" if torch.cuda.is_avai
 
 def build_model_for_dataset(
     checkpoint_path: str,
-    dataset: ProteomeDataset,
+    dataset: ExpressionDataset,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     fasta_path: str | None = None,
     esmc_cache: str | None = None,
@@ -101,7 +100,7 @@ def build_model_for_dataset(
 
     Args:
         checkpoint_path: path to the .ckpt file.
-        dataset: a loaded ProteomeDataset (provides protein names).
+        dataset: a loaded ExpressionDataset (provides protein names).
         device: torch device string.
         fasta_path: path to FASTA file. Defaults to the one stored in checkpoint config.
         esmc_cache: path to precomputed ESM-C embeddings (.pt). Defaults to checkpoint config.
@@ -114,8 +113,8 @@ def build_model_for_dataset(
     model_cfg = _build_model_cfg(cfg)
     use_esmc = model_cfg["use_esmc"]
 
-    protein_names = list(dataset.data.index)
-    model_cfg["num_proteins"] = len(protein_names)
+    feature_names = list(dataset.feature_names)
+    model_cfg["num_features"] = len(feature_names)
 
     esmc_lookup = None
     if use_esmc:
@@ -123,7 +122,7 @@ def build_model_for_dataset(
         fasta = fasta_path or cfg["model"]["fasta_path"]
         cache = esmc_cache or cfg["model"].get("esmc_cache")
         esmc_lookup = build_esmc_lookup(
-            protein_names, fasta, cfg["model"].get("esmc_model", "esmc_600m"),
+            feature_names, fasta, cfg["model"].get("esmc_model", "esmc_600m"),
             cache_path=cache,
         )
 
@@ -205,7 +204,7 @@ def predict(
             pred_ctx           list[np.ndarray]            — ctx-head predictions per sample (eval mode only)
             pred_pst           list[np.ndarray]            — pst-head predictions per sample (eval mode only)
             true_bins          list[np.ndarray]            — ground-truth bins per sample (eval mode only)
-            target_protein_ids list[np.ndarray]            — target protein IDs per sample (eval mode only)
+            target_feature_ids list[np.ndarray]            — target protein IDs per sample (eval mode only)
             sample_ids         list[str]                   — sample identifiers (same order as rows)
             config             dict                        — full config dict from checkpoint
     """
@@ -217,7 +216,7 @@ def predict(
     mcfg = cfg["model"]
     dcfg = cfg["data"]
 
-    detect_groups = dcfg.get("has_protein_groups", False)
+    detect_groups = dcfg.get("detect_groups", dcfg.get("has_protein_groups", False))
     pg_cfg = mcfg.get("protein_groups", {})
     pg_enabled = pg_cfg.get("enabled", False)
     abs_cfg = mcfg.get("absent_species", {})
@@ -225,25 +224,23 @@ def predict(
 
     log.info(f"Loading dataset from {data_path} ...")
     max_group_size = pg_cfg.get("max_group_size", 1) if pg_enabled else 1
-    group_cache = str(Path(data_path).parent / f"{Path(data_path).stem}_groups.pt") if detect_groups else None
-    ds = load_dataset(data_path, num_bins=dcfg["num_bins"], detect_groups=detect_groups,
-                      max_group_size=max_group_size, group_cache_path=group_cache,
-                      include_absent=abs_enabled)
-    sample_ids = list(ds.data.columns)  # after transpose: columns = samples
+    ds = ExpressionDataset(data_path, num_bins=dcfg["num_bins"],
+                           detect_groups=detect_groups, max_group_size=max_group_size)
+    sample_ids = list(ds.sample_ids)
 
     # build model with ESM-C embeddings for this dataset's proteins
     model, cfg = build_model_for_dataset(checkpoint_path, ds, device, fasta_path, esmc_cache)
 
     # collator: in inference mode use all detected proteins as context
-    protein_context_ratio = mcfg["protein_context_ratio"] if mode == "eval" else 1.0
+    feature_context_ratio = mcfg["feature_context_ratio"] if mode == "eval" else 1.0
     group_context_ratio = pg_cfg.get("group_context_ratio", 1.0) if mode == "eval" else 1.0
     absent_context_ratio = abs_cfg.get("absent_context_ratio", 1.0) if mode == "eval" else 1.0
-    collator = ProteomeCollator(
-        protein_context_ratio=protein_context_ratio,
+    collator = ExpressionCollator(
+        num_features=ds.num_features(),
+        feature_context_ratio=feature_context_ratio,
         group_context_ratio=group_context_ratio,
-        input_proteins=mcfg["input_proteins"],
+        input_features=mcfg["input_features"],
         protein_groups_enabled=pg_enabled,
-        max_group_size=pg_cfg.get("max_group_size", 1),
         input_groups=pg_cfg.get("input_groups", 0) if pg_enabled else 0,
         absent_species_enabled=abs_enabled,
         input_absent=abs_cfg.get("input_absent", 0),
@@ -271,7 +268,7 @@ def predict(
             if mode == "eval":
                 for pc, pp, tb, tid in zip(
                     out["pred_ctx"], out["pred_pst"],
-                    out["true_bins"], out["target_protein_ids"],
+                    out["true_bins"], out["target_feature_ids"],
                 ):
                     all_pred_ctx.append(pc.cpu().numpy())
                     all_pred_pst.append(pp.cpu().numpy())
@@ -288,7 +285,7 @@ def predict(
         result["pred_ctx"]           = all_pred_ctx
         result["pred_pst"]           = all_pred_pst
         result["true_bins"]          = all_true_bins
-        result["target_protein_ids"] = all_target_ids
+        result["target_feature_ids"] = all_target_ids
 
         # compute aggregate metrics for convenience
         all_pc = np.concatenate(all_pred_ctx)
@@ -312,7 +309,7 @@ def predict(
 # 2.  visualize_proteins
 def visualize_proteins(
     model: ProtGPT | str,
-    dataset: ProteomeDataset,
+    dataset: ExpressionDataset,
     metadata: pd.DataFrame | None = None,
     color_by: str | None = None,
     method: str = "umap",
@@ -323,13 +320,13 @@ def visualize_proteins(
     """
     Visualize the learned protein embeddings from the model's embedding layer.
 
-    Uses the ProteomeDataset to know which proteins exist and retrieve their
+    Uses the ExpressionDataset to know which proteins exist and retrieve their
     learned embeddings from the model.  Metadata is joined via a 'protein_id'
     column (or index) that should match the protein names in the dataset.
 
     Args:
         model: a loaded ProtGPT model, or path to a .ckpt file.
-        dataset: a loaded ProteomeDataset (provides protein names and indices).
+        dataset: a loaded ExpressionDataset (provides protein names and indices).
         metadata: optional DataFrame with a 'protein_id' column (or index named
                   'protein_id') matching the protein names in the dataset, plus
                   the column specified by color_by.  If None, plots without coloring.
@@ -346,21 +343,21 @@ def visualize_proteins(
     if isinstance(model, str):
         model, _ = _load_model(model)
 
-    # protein names from the dataset (row index after transpose)
-    protein_names = list(dataset.data.index)  # length = num_proteins
+    # protein names from the dataset (var_names / accessions, index order)
+    feature_names = list(dataset.feature_names)  # length = num_features
 
-    # extract embeddings: indices 1..num_proteins in the embedding layer
+    # extract embeddings: indices 1..num_features in the embedding layer
     # (index 0 is the padding token, real proteins are 1-indexed)
     device = next(model.parameters()).device
-    indices = torch.arange(1, len(protein_names) + 1, device=device)
-    emb_weights = model.protein_emb(indices).detach().cpu().numpy()  # (num_proteins, d_model)
+    indices = torch.arange(1, len(feature_names) + 1, device=device)
+    emb_weights = model.feature_emb(indices).detach().cpu().numpy()  # (num_features, d_model)
 
     # reduce
     coords = _reduce(emb_weights, method=method, **reducer_kwargs)
 
     # build result dataframe
     result = pd.DataFrame({
-        "protein_id": protein_names,
+        "protein_id": feature_names,
         "dim_1": coords[:, 0],
         "dim_2": coords[:, 1],
     })

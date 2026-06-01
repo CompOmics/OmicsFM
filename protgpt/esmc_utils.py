@@ -168,6 +168,8 @@ if __name__ == "__main__":
     parser.add_argument("--fasta", required=True, help="Path to UniProt FASTA file")
     parser.add_argument("--save", required=True, help="Output path for the .pt cache file")
     parser.add_argument("--model", default="esmc_600m", help="ESM-C model name (default: esmc_600m)")
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu",
+                        help="Device for ESM-C inference (default: cuda if available, else cpu)")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -177,7 +179,7 @@ if __name__ == "__main__":
     log.info(f"  {len(sequences)} sequences loaded")
 
     proteins = sorted(sequences.keys())
-    embeddings = compute_esmc_embeddings(proteins, sequences, args.model)
+    embeddings = compute_esmc_embeddings(proteins, sequences, args.model, device=args.device)
 
     emb_dim = next(iter(embeddings.values())).shape[0]
     os.makedirs(os.path.dirname(args.save) or ".", exist_ok=True)
