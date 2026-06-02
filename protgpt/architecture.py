@@ -141,14 +141,14 @@ class ProtGPT(nn.Module):
     Input: dict from ExpressionCollator with role, feature_ids, bin_values tensors.
     Flow:
         1. Embed tokens: feature_emb + bin_emb (targets get no bin signal).
-        2. Override position 0 with the Proteome Summary Token (PST).
+        2. Override position 0 with the Sample Summary Token (SST).
         3. Run through transformer with custom attention mask:
-           - PST + context attend to PST + context.
-           - Each target attends to PST + context only (not other targets).
+           - SST + context attend to SST + context.
+           - Each target attends to SST + context only (not other targets).
         4. Two prediction heads:
            a) ctx_head: predict target bins from their output representations.
-           b) pst_head: predict target bins using PST output ⊕ protein identity.
-        5. Loss = MSE(ctx_head) + MSE(pst_head).
+           b) sst_head: predict target bins using SST output ⊕ protein identity.
+        5. Loss = MSE(ctx_head) + MSE(sst_head).
     """
 
     def __init__(self, config: dict, esmc_lookup: torch.Tensor = None):
@@ -160,7 +160,7 @@ class ProtGPT(nn.Module):
             # frozen ESM-C embeddings + trainable projection to d_model
             esmc_dim = esmc_lookup.shape[1]
             self.esmc_embedding = nn.Embedding.from_pretrained(esmc_lookup, freeze=True)
-            #NOTE: play around with how the projection is done
+            #NOTE: experiment with how the projection is done
             # 1. self.esmc_proj = nn.Linear(esmc_dim, config['d_model'])  # simple linear projection
             # 2. mlp projection
             self.esmc_proj = nn.Sequential(
@@ -175,8 +175,8 @@ class ProtGPT(nn.Module):
         # bin embedding: 0 = not detected (absent proteins in context), 1..num_bins = expression bins
         self.bin_emb = nn.Embedding(config['num_bins'] + 1, config['d_model'])
 
-        # PST: learnable initial vector (same for every sample, scale matches embedding init)
-        self.pst_token = nn.Parameter(torch.randn(config['d_model']) * 0.02)
+        # SST: learnable initial vector (same for every sample, scale matches embedding init)
+        self.sst_token = nn.Parameter(torch.randn(config['d_model']) * 0.02)
 
         # transformer stack
         self.layers = nn.ModuleList([
@@ -191,14 +191,14 @@ class ProtGPT(nn.Module):
             nn.Linear(config['d_model'], 1),
         )
 
-        # head 2: PST-only prediction (PST repr ⊕ protein emb → bin)
-        self.pst_head = nn.Sequential(
+        # head 2: SST-only prediction (SST repr ⊕ protein emb → bin)
+        self.sst_head = nn.Sequential(
             nn.Linear(config['d_model'] * 2, config['d_model']),
             nn.GELU(),
             nn.Linear(config['d_model'], 1),
         )
 
-        # NOTE: for later application we could add more heads that predict other properties from the PST or target representations
+        # NOTE: for later application we could add more heads that predict other properties from the SST or target representations
         # one could be predicting if a protein is present in the proteome or not
         # or predicting which of 2 proteins is highest expressed, etc.
         # this multi-task self-supervised setup could encourage the model to learn more general and useful representations of the proteome
@@ -247,13 +247,13 @@ class ProtGPT(nn.Module):
           1. Context queries (role=1) attend to context keys only (role=1).
           2. Target queries  (role=2) attend to context keys only (role=1).
              → targets cannot see other targets or padding.
-          3. Padding queries (role=0) attend to PST (position 0) only.
+          3. Padding queries (role=0) attend to SST (position 0) only.
              → prevents NaN in softmax; padding outputs are never used.
-          In short: only context positions (including PST) are valid keys,
+          In short: only context positions (including SST) are valid keys,
           and only non-padding positions are real queries.
 
         Args:
-            role: (batch, input) with 0=padding, 1=context/PST, 2=target
+            role: (batch, input) with 0=padding, 1=context/SST, 2=target
             n_heads: number of attention heads
 
         Returns:
@@ -264,7 +264,7 @@ class ProtGPT(nn.Module):
         is_valid_query = (role >= 1).unsqueeze(2)   # (batch, input, 1)
         allowed = is_valid_query & is_ctx_key        # (batch, input, input)
 
-        # Patch: let padding rows attend to PST (position 0) so softmax
+        # Patch: let padding rows attend to SST (position 0) so softmax
         # gets at least one finite value and doesn't produce NaN → rule 3
         allowed[:, :, 0] |= (role == 0)
 
@@ -278,16 +278,16 @@ class ProtGPT(nn.Module):
 
         Args:
             batch: dict from ExpressionCollator with keys:
-                role         (batch, input): 0=padding, 1=context/PST, 2=target
+                role         (batch, input): 0=padding, 1=context/SST, 2=target
                 feature_ids  (batch, input): protein indices
                 bin_values   (batch, input): true bin values
 
         Returns:
             dict with keys:
                 transformer_out    (batch, seq_len, d_model): full transformer output
-                pst_emb            (batch, d_model): proteome summary token embedding per sample
+                sst_emb            (batch, d_model): sample summary token embedding per sample
                 pred_ctx           list of (num_targets,) tensors: ctx_head predictions per sample
-                pred_pst           list of (num_targets,) tensors: pst_head predictions per sample
+                pred_sst           list of (num_targets,) tensors: sst_head predictions per sample
                 true_bins          list of (num_targets,) tensors: ground-truth bins per sample
                 target_feature_ids list of (num_targets,) tensors: protein IDs for each target
                 role               (batch, seq_len): passthrough of the role tensor
@@ -332,7 +332,7 @@ class ProtGPT(nn.Module):
         bin_emb = self.bin_emb(bin_values)
         bin_emb = bin_emb * (role != 2).unsqueeze(-1)  # zero out target bins
         token_emb = prot_emb + bin_emb  # (batch, input, d)
-        token_emb[:, 0, :] = self.pst_token  # override position 0 with PST
+        token_emb[:, 0, :] = self.sst_token  # override position 0 with SST
 
         # attention mask from role tensor (vectorized)
         attn_mask = self._build_attention_mask(role, self.config['n_heads'])
@@ -343,8 +343,8 @@ class ProtGPT(nn.Module):
             x = layer(x, attn_mask=attn_mask)
         x = self.final_norm(x)  # (batch, input, d)
 
-        # extract PST embeddings (position 0 for every sample)
-        pst_emb = x[:, 0, :]  # (batch, d)
+        # extract SST embeddings (position 0 for every sample)
+        sst_emb = x[:, 0, :]  # (batch, d)
 
         # vectorized target extraction across the whole batch
         tgt_mask = (role == 2)  # (B, S)
@@ -354,10 +354,10 @@ class ProtGPT(nn.Module):
             tgt_repr = x[batch_idx, seq_idx]           # (N_total, d)
             pred_ctx = self.ctx_head(tgt_repr).squeeze(-1)  # (N_total,)
 
-            pst_expanded = pst_emb[batch_idx]           # (N_total, d)
+            sst_expanded = sst_emb[batch_idx]           # (N_total, d)
             tgt_prot = prot_emb[batch_idx, seq_idx]     # (N_total, d)
-            pst_input = torch.cat([pst_expanded, tgt_prot], dim=-1)
-            pred_pst = self.pst_head(pst_input).squeeze(-1)  # (N_total,)
+            sst_input = torch.cat([sst_expanded, tgt_prot], dim=-1)
+            pred_sst = self.sst_head(sst_input).squeeze(-1)  # (N_total,)
 
             true_bins_flat = bin_values[batch_idx, seq_idx].float()
             tgt_ids_flat = feature_ids[batch_idx, seq_idx]
@@ -365,22 +365,22 @@ class ProtGPT(nn.Module):
             # split back into per-sample lists
             counts = tgt_mask.sum(dim=1)  # (B,)
             all_pred_ctx = list(pred_ctx.split(counts.tolist()))
-            all_pred_pst = list(pred_pst.split(counts.tolist()))
+            all_pred_sst = list(pred_sst.split(counts.tolist()))
             all_true_bins = list(true_bins_flat.split(counts.tolist()))
             all_target_ids = list(tgt_ids_flat.split(counts.tolist()))
         else:
             empty_f = torch.tensor([], device=x.device)
             empty_l = torch.tensor([], device=x.device, dtype=torch.long)
             all_pred_ctx = [empty_f] * batch_size
-            all_pred_pst = [empty_f] * batch_size
+            all_pred_sst = [empty_f] * batch_size
             all_true_bins = [empty_f] * batch_size
             all_target_ids = [empty_l] * batch_size
 
         return {
             "transformer_out":    x,
-            "pst_emb":            pst_emb,
+            "sst_emb":            sst_emb,
             "pred_ctx":           all_pred_ctx,
-            "pred_pst":           all_pred_pst,
+            "pred_sst":           all_pred_sst,
             "true_bins":          all_true_bins,
             "target_feature_ids": all_target_ids,
             "role":               role,
@@ -397,7 +397,7 @@ class ProtGPT(nn.Module):
             batch: dict from ExpressionCollator (same as forward()).
 
         Returns:
-            (total_loss, ctx_loss, pst_loss)
+            (total_loss, ctx_loss, sst_loss)
         """
         role = batch["role"]
         device = role.device
@@ -415,22 +415,22 @@ class ProtGPT(nn.Module):
         # extract flat predictions for samples that have targets
         batch_idx, seq_idx = tgt_mask.nonzero(as_tuple=True)
         pred_ctx_flat = torch.cat(out["pred_ctx"])  # (N_total,)
-        pred_pst_flat = torch.cat(out["pred_pst"])  # (N_total,)
+        pred_sst_flat = torch.cat(out["pred_sst"])  # (N_total,)
         true_flat = torch.cat(out["true_bins"])      # (N_total,)
 
         # per-target squared errors
         se_ctx = (pred_ctx_flat - true_flat).square()
-        se_pst = (pred_pst_flat - true_flat).square()
+        se_sst = (pred_sst_flat - true_flat).square()
 
         # per-sample MSE via scatter_add, then average across samples
         valid_counts = counts[has_targets].float()
         n_valid = valid_counts.numel()
 
         sample_se_ctx = torch.zeros(role.shape[0], device=device)
-        sample_se_pst = torch.zeros(role.shape[0], device=device)
+        sample_se_sst = torch.zeros(role.shape[0], device=device)
         sample_se_ctx.scatter_add_(0, batch_idx, se_ctx)
-        sample_se_pst.scatter_add_(0, batch_idx, se_pst)
+        sample_se_sst.scatter_add_(0, batch_idx, se_sst)
 
         avg_ctx = (sample_se_ctx[has_targets] / valid_counts).sum() / n_valid
-        avg_pst = (sample_se_pst[has_targets] / valid_counts).sum() / n_valid
-        return avg_ctx + avg_pst, avg_ctx, avg_pst
+        avg_sst = (sample_se_sst[has_targets] / valid_counts).sum() / n_valid
+        return avg_ctx + avg_sst, avg_ctx, avg_sst

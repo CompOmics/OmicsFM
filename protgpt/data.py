@@ -11,7 +11,7 @@ protgpt/convert.py).
 config. The cache is memory-mapped (or loaded fully into RAM when it fits), so the
 training hot-loop never touches the h5ad and never holds the full matrix in RAM.
 
-`ExpressionCollator` assembles batches: a `[PST | individuals | groups | absent]`
+`ExpressionCollator` assembles batches: a `[SST | individuals | groups | absent]`
 sequence with per-type subsampling. Protein groups are stored ragged and padded to
 the **batch-local** max group size; absent species are sampled on the fly.
 """
@@ -357,13 +357,13 @@ class ExpressionDataset(Dataset):
 class ExpressionCollator:
     """Collate samples into the model's batched sequence tensors.
 
-    Sequence layout: [PST, individuals…PAD, groups…PAD, absent…PAD].
+    Sequence layout: [SST, individuals…PAD, groups…PAD, absent…PAD].
     Individuals / groups / absent each have their own budget and context ratio.
     Groups are padded to the **batch-local** max group size; absent species are
     sampled on the fly from proteins not detected in the sample.
 
     Returns dict:
-        role         (B, S):    0=padding, 1=context/PST, 2=target
+        role         (B, S):    0=padding, 1=context/SST, 2=target
         feature_ids  (B, S, G): protein ids per position (G = batch-local max group size)
         bin_values   (B, S):    expression bins
         group_sizes  (B, S):    members per position (only when protein_groups_enabled)
@@ -404,7 +404,7 @@ class ExpressionCollator:
         abs_seg = grp_seg + self.input_groups
 
         for i, p in enumerate(prepared):
-            role[i, 0] = 1  # PST
+            role[i, 0] = 1  # SST
 
             # individuals (width 1)
             n_ind = len(p["ind_ids"])

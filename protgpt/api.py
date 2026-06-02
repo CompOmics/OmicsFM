@@ -4,7 +4,7 @@ ProtGPT API — inference, evaluation, and visualization.
 Functions:
     predict             : Run the model on a dataset; returns embeddings, predictions, and metadata.
     visualize_proteins  : Reduce & plot the learned protein embeddings (from the embedding layer).
-    visualize_proteomes : Reduce & plot the learned proteome (PST) embeddings from predict() output.
+    visualize_proteomes : Reduce & plot the learned sample-summary (SST) embeddings from predict() output.
 """
 
 import logging
@@ -191,7 +191,7 @@ def predict(
         mode: 'eval'      — use context/target split (context_ratio from config) so
                              predictions and losses can be evaluated.
               'inference'  — all detected proteins become context (context_ratio=1.0).
-                             No targets, but PST embeddings capture the full proteome.
+                             No targets, but SST embeddings capture the full proteome.
         device: torch device string (e.g. 'cuda', 'cuda:0', 'cpu').
         batch_size: batch size for the dataloader.
         num_workers: number of dataloader workers.
@@ -200,9 +200,9 @@ def predict(
 
     Returns:
         dict with keys:
-            pst_emb            np.ndarray  (N, d_model)    — PST embedding per sample
+            sst_emb            np.ndarray  (N, d_model)    — SST embedding per sample
             pred_ctx           list[np.ndarray]            — ctx-head predictions per sample (eval mode only)
-            pred_pst           list[np.ndarray]            — pst-head predictions per sample (eval mode only)
+            pred_sst           list[np.ndarray]            — sst-head predictions per sample (eval mode only)
             true_bins          list[np.ndarray]            — ground-truth bins per sample (eval mode only)
             target_feature_ids list[np.ndarray]            — target protein IDs per sample (eval mode only)
             sample_ids         list[str]                   — sample identifiers (same order as rows)
@@ -252,9 +252,9 @@ def predict(
     )
 
     # run forward in eval mode
-    all_pst = []
+    all_sst = []
     all_pred_ctx = []
-    all_pred_pst = []
+    all_pred_sst = []
     all_true_bins = []
     all_target_ids = []
 
@@ -263,45 +263,45 @@ def predict(
             batch = {k: v.to(device) for k, v in batch.items()}
             out = model(batch)
 
-            all_pst.append(out["pst_emb"].cpu().numpy())
+            all_sst.append(out["sst_emb"].cpu().numpy())
 
             if mode == "eval":
                 for pc, pp, tb, tid in zip(
-                    out["pred_ctx"], out["pred_pst"],
+                    out["pred_ctx"], out["pred_sst"],
                     out["true_bins"], out["target_feature_ids"],
                 ):
                     all_pred_ctx.append(pc.cpu().numpy())
-                    all_pred_pst.append(pp.cpu().numpy())
+                    all_pred_sst.append(pp.cpu().numpy())
                     all_true_bins.append(tb.cpu().numpy())
                     all_target_ids.append(tid.cpu().numpy())
 
     result = {
-        "pst_emb":            np.concatenate(all_pst, axis=0),  # (N, d_model)
+        "sst_emb":            np.concatenate(all_sst, axis=0),  # (N, d_model)
         "sample_ids":         sample_ids,
 
     }
 
     if mode == "eval":
         result["pred_ctx"]           = all_pred_ctx
-        result["pred_pst"]           = all_pred_pst
+        result["pred_sst"]           = all_pred_sst
         result["true_bins"]          = all_true_bins
         result["target_feature_ids"] = all_target_ids
 
         # compute aggregate metrics for convenience
         all_pc = np.concatenate(all_pred_ctx)
-        all_pp = np.concatenate(all_pred_pst)
+        all_pp = np.concatenate(all_pred_sst)
         all_tb = np.concatenate(all_true_bins)
         result["metrics"] = {
             "ctx_mse": float(np.mean((all_pc - all_tb) ** 2)),
-            "pst_mse": float(np.mean((all_pp - all_tb) ** 2)),
+            "sst_mse": float(np.mean((all_pp - all_tb) ** 2)),
             "ctx_mae": float(np.mean(np.abs(all_pc - all_tb))),
-            "pst_mae": float(np.mean(np.abs(all_pp - all_tb))),
+            "sst_mae": float(np.mean(np.abs(all_pp - all_tb))),
             "n_predictions": len(all_tb),
         }
         log.info(f"Eval metrics: ctx_mse={result['metrics']['ctx_mse']:.4f}, "
-                 f"pst_mse={result['metrics']['pst_mse']:.4f}")
+                 f"sst_mse={result['metrics']['sst_mse']:.4f}")
 
-    log.info(f"Done. PST embeddings shape: {result['pst_emb'].shape}")
+    log.info(f"Done. SST embeddings shape: {result['sst_emb'].shape}")
     return result
 
 
@@ -401,10 +401,10 @@ def visualize_proteomes(
     **reducer_kwargs,
 ) -> pd.DataFrame:
     """
-    Visualize the learned proteome (PST) embeddings produced by predict().
+    Visualize the learned sample-summary (SST) embeddings produced by predict().
 
     Args:
-        predictions: output dict from predict() — must contain 'pst_emb' and 'sample_ids'.
+        predictions: output dict from predict() — must contain 'sst_emb' and 'sample_ids'.
         metadata: optional DataFrame with a 'sample_id' column (or index) matching
                   the sample IDs from the dataset.  If None, plots without coloring.
         color_by: column name in metadata to colour the scatter plot by.
@@ -417,11 +417,11 @@ def visualize_proteomes(
     Returns:
         DataFrame with columns: sample_id, dim_1, dim_2, and optionally <color_by>.
     """
-    pst_emb = predictions["pst_emb"]         # (N, d_model)
+    sst_emb = predictions["sst_emb"]         # (N, d_model)
     sample_ids = predictions["sample_ids"]    # list of str
 
     # reduce
-    coords = _reduce(pst_emb, method=method, **reducer_kwargs)
+    coords = _reduce(sst_emb, method=method, **reducer_kwargs)
 
     # build result dataframe
     result = pd.DataFrame({
@@ -448,7 +448,7 @@ def visualize_proteomes(
     ax.set_xlabel("Dimension 1")
     ax.set_ylabel("Dimension 2")
     title_suffix = f" colored by {color_by}" if color_by and color_by in result.columns else ""
-    ax.set_title(f"Proteome (PST) embeddings ({method.upper()}){title_suffix}")
+    ax.set_title(f"Sample-summary (SST) embeddings ({method.upper()}){title_suffix}")
     plt.tight_layout()
     if save_path:
         fig.savefig(save_path, dpi=150, bbox_inches="tight")

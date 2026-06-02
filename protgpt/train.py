@@ -44,7 +44,7 @@ def load_dataset(path: str, num_bins: int, detect_groups: bool = False,
 def evaluate(model, dataloader, device):
     """Run one pass over a dataloader, return avg losses."""
     model.eval()
-    total_loss, ctx_loss, pst_loss, n = 0.0, 0.0, 0.0, 0
+    total_loss, ctx_loss, sst_loss, n = 0.0, 0.0, 0.0, 0
     for batch in dataloader:
         batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
@@ -52,11 +52,11 @@ def evaluate(model, dataloader, device):
         num_samples = batch["role"].shape[0]
         total_loss += loss.item() * num_samples
         ctx_loss += lc.item() * num_samples
-        pst_loss += lp.item() * num_samples
+        sst_loss += lp.item() * num_samples
         n += num_samples
     if n == 0:
         return 0.0, 0.0, 0.0
-    return total_loss / n, ctx_loss / n, pst_loss / n
+    return total_loss / n, ctx_loss / n, sst_loss / n
 
 
 # main
@@ -198,7 +198,7 @@ def train(config_path: str):
         if transfer_cfg.get("freeze_transformer", False) and freeze_epochs > 0:
             log.info(f"  Freezing transformer layers for {freeze_epochs} epochs")
             for name, param in model.named_parameters():
-                if "blocks" in name:
+                if "layers." in name:  # transformer blocks live in self.layers
                     param.requires_grad = False
 
     model = torch.compile(model)
@@ -229,17 +229,44 @@ def train(config_path: str):
     best_val_loss = float("inf")
     patience_counter = 0
     val_freq = tcfg["val_frequency"]
-
-    # compute validation step indices within an epoch
     n_batches = len(train_dl)
-    if val_freq > 0 and val_freq < 1:
+
+    # Single validation cadence
+    #   0 < val_freq < 1  → every `val_every` batches within an epoch (no end-of-epoch run)
+    #   val_freq >= 1     → at the end of every `val_epochs` epochs
+    #   val_freq <= 0     → at the end of every epoch
+    if 0 < val_freq < 1:
         val_every = max(1, int(n_batches * val_freq))
-    elif val_freq >= 1:
-        val_every = n_batches * int(val_freq)
+        val_epochs = None
     else:
-        val_every = None  # no intra-epoch validation
+        val_every = None
+        val_epochs = max(1, int(val_freq)) if val_freq and val_freq >= 1 else 1
+    cadence = (f"every {val_every} batches" if val_every
+               else f"every {val_epochs} epoch(s)")
     log.info(f"Training: {tcfg['max_epochs']} epochs, {n_batches} batches/epoch, "
-             f"batch_size={tcfg['batch_size']}, validate every {val_every} batches")
+             f"batch_size={tcfg['batch_size']}, validate {cadence}")
+
+    def run_validation(tag=""):
+        """Evaluate on valid, log, update best/patience, save best.
+
+        The single place validation happens. Returns True when early-stopping
+        patience is exhausted.
+        """
+        nonlocal best_val_loss, patience_counter
+        vl, vc, vp = evaluate(model, valid_dl, device)
+        log.info(f"  {tag}val_loss={vl:.4f} (ctx={vc:.4f} sst={vp:.4f})")
+        wandb.log({"val/loss": vl, "val/ctx_loss": vc, "val/sst_loss": vp,
+                   "global_step": global_step})
+        if vl < best_val_loss - tcfg["early_stopping_delta"]:
+            best_val_loss = vl
+            patience_counter = 0
+            torch.save({"model": model.state_dict(), "config": cfg, "epoch": epoch,
+                        "val_loss": vl, "feature_names": feature_names}, best_path)
+            log.info(f"  ✓ New best model saved (val_loss={vl:.4f})")
+        else:
+            patience_counter += 1
+        model.train()
+        return patience_counter >= tcfg["early_stopping_patience"]
 
     freeze_epochs = transfer_cfg.get("freeze_epochs", 0) if transfer_ckpt else 0
 
@@ -249,13 +276,15 @@ def train(config_path: str):
         if freeze_epochs > 0 and epoch == freeze_epochs + 1:
             log.info(f"Unfreezing transformer layers at epoch {epoch}")
             for name, param in model.named_parameters():
-                param.requires_grad = True
+                if "layers." in name:  # only the transformer blocks we froze; keep ESM-C frozen
+                    param.requires_grad = True
             n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
             log.info(f"  Trainable parameters: {n_params:,}")
 
         model.train()
-        epoch_loss, epoch_ctx, epoch_pst, epoch_n = 0.0, 0.0, 0.0, 0
+        epoch_loss, epoch_ctx, epoch_sst, epoch_n = 0.0, 0.0, 0.0, 0
         t0 = time.time()
+        should_stop = False
 
         pbar = tqdm(train_dl, desc=f"Epoch {epoch}/{tcfg['max_epochs']}", leave=True)
         for batch_idx, batch in enumerate(pbar, 1):
@@ -272,87 +301,63 @@ def train(config_path: str):
             num_samples = batch["role"].shape[0]
             epoch_loss += loss.item() * num_samples
             epoch_ctx += lc.item() * num_samples
-            epoch_pst += lp.item() * num_samples
+            epoch_sst += lp.item() * num_samples
             epoch_n += num_samples
 
             # update progress bar with running averages
             pbar.set_postfix(
                 loss=f"{epoch_loss / epoch_n:.4f}",
                 ctx=f"{epoch_ctx / epoch_n:.4f}",
-                pst=f"{epoch_pst / epoch_n:.4f}",
+                sst=f"{epoch_sst / epoch_n:.4f}",
             )
 
             # log step-level metrics to wandb
             wandb.log({
                 "train/step_loss": loss.item(),
                 "train/step_ctx_loss": lc.item(),
-                "train/step_pst_loss": lp.item(),
+                "train/step_sst_loss": lp.item(),
                 "global_step": global_step,
             })
 
             global_step += 1
 
-            # intra-epoch validation
+            # intra-epoch validation (fractional val_frequency only)
             if val_every and batch_idx % val_every == 0:
-                vl, vc, vp = evaluate(model, valid_dl, device)
-                log.info(f"  [epoch {epoch} batch {batch_idx}/{n_batches}] val_loss={vl:.4f} (ctx={vc:.4f} pst={vp:.4f})")
-                wandb.log({
-                    "val/loss": vl,
-                    "val/ctx_loss": vc,
-                    "val/pst_loss": vp,
-                    "global_step": global_step,
-                })
-                model.train()
+                if run_validation(f"[epoch {epoch} batch {batch_idx}/{n_batches}] "):
+                    should_stop = True
+                    break
 
-                if vl < best_val_loss - tcfg["early_stopping_delta"]:
-                    best_val_loss = vl
-                    patience_counter = 0
-                    torch.save({"model": model.state_dict(), "config": cfg, "epoch": epoch, "val_loss": vl, "feature_names": feature_names}, best_path)
-                    log.info(f"  ✓ New best model saved (val_loss={vl:.4f})")
-                else:
-                    patience_counter += 1
-
-        # epoch summary
+        # epoch summary (always logged)
         dt = time.time() - t0
         tl = epoch_loss / max(epoch_n, 1)
         tc = epoch_ctx / max(epoch_n, 1)
-        tp = epoch_pst / max(epoch_n, 1)
-        log.info(f"Epoch {epoch}/{tcfg['max_epochs']} ({dt:.0f}s) — train_loss={tl:.4f} (ctx={tc:.4f} pst={tp:.4f})")
-
-        # end-of-epoch validation
-        vl, vc, vp = evaluate(model, valid_dl, device)
-        log.info(f"  val_loss={vl:.4f} (ctx={vc:.4f} pst={vp:.4f})")
-
-        # log epoch-level metrics to wandb
+        tp = epoch_sst / max(epoch_n, 1)
+        log.info(f"Epoch {epoch}/{tcfg['max_epochs']} ({dt:.0f}s) — train_loss={tl:.4f} (ctx={tc:.4f} sst={tp:.4f})")
         wandb.log({
             "train/epoch_loss": tl,
             "train/epoch_ctx_loss": tc,
-            "train/epoch_pst_loss": tp,
-            "val/loss": vl,
-            "val/ctx_loss": vc,
-            "val/pst_loss": vp,
+            "train/epoch_sst_loss": tp,
             "epoch": epoch,
         })
 
-        if vl < best_val_loss - tcfg["early_stopping_delta"]:
-            best_val_loss = vl
-            patience_counter = 0
-            torch.save({"model": model.state_dict(), "config": cfg, "epoch": epoch, "val_loss": vl, "feature_names": feature_names}, best_path)
-            log.info(f"  ✓ New best model saved (val_loss={vl:.4f})")
-        else:
-            patience_counter += 1
+        # epoch-based validation (only when not using the intra-epoch cadence)
+        if not should_stop and val_epochs is not None and epoch % val_epochs == 0:
+            should_stop = run_validation()
 
-        if patience_counter >= tcfg["early_stopping_patience"]:
+        if should_stop:
             log.info(f"Early stopping at epoch {epoch} (patience={tcfg['early_stopping_patience']})")
             break
 
-    # test evaluation
-    log.info("Loading best model for test evaluation ...")
-    ckpt = torch.load(best_path, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt["model"])
+    # test evaluation — load the best checkpoint if validation ever saved one
+    if best_path.exists():
+        log.info("Loading best model for test evaluation ...")
+        ckpt = torch.load(best_path, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model"])
+    else:
+        log.warning("No best checkpoint saved (validation never ran?) — testing the final model")
     tl, tc, tp = evaluate(model, test_dl, device)
-    log.info(f"Test loss={tl:.4f} (ctx={tc:.4f} pst={tp:.4f})")
-    wandb.log({"test/loss": tl, "test/ctx_loss": tc, "test/pst_loss": tp})
+    log.info(f"Test loss={tl:.4f} (ctx={tc:.4f} sst={tp:.4f})")
+    wandb.log({"test/loss": tl, "test/ctx_loss": tc, "test/sst_loss": tp})
     wandb.finish()
     log.info("Done.")
 
