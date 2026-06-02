@@ -2,9 +2,14 @@
 ProtGPT API — inference, evaluation, and visualization.
 
 Functions:
-    predict             : Run the model on a dataset; returns embeddings, predictions, and metadata.
-    visualize_proteins  : Reduce & plot the learned protein embeddings (from the embedding layer).
-    visualize_proteomes : Reduce & plot the learned sample-summary (SST) embeddings from predict() output.
+    compute_sst          : Sample Summary Token (SST) embedding per sample — whole-sample representation.
+    predict              : Predict held-out expression bins (masked-modeling eval); predictions + metrics.
+    visualize_proteins   : Reduce & plot the learned protein embeddings (learned-embedding models only).
+    visualize_sst        : Reduce & plot the SST embeddings from compute_sst() output.
+    eval_attention_heads : Score every (layer, head) by PPI enrichment to find the best head.
+    attention_map        : Accumulate the protein×protein attention map (mean or one head).
+    enrichment_curves    : Enrichment curves of an attention map vs PPI ground-truth databases.
+    load_ppi_ground_truth: Load a bundled PPI ground-truth matrix (corum/string/kegg/reactome/gocc).
 """
 
 import logging
@@ -12,7 +17,6 @@ import numpy as np
 import pandas as pd
 import torch
 import yaml
-import matplotlib.pyplot as plt
 from pathlib import Path
 from torch.utils.data import DataLoader
 from sklearn.decomposition import PCA
@@ -144,8 +148,13 @@ def build_model_for_dataset(
 
 
 def _reduce(embeddings: np.ndarray, method: str = "umap", n_components: int = 2, **kwargs) -> np.ndarray:
-    """Dimensionality reduction wrapper.
-    
+    """Dimensionality reduction wrapper with sensible, reproducible defaults.
+
+    Defaults (override via kwargs):
+        pca  : random_state=0
+        umap : n_neighbors=75, min_dist=0.3, random_state=42
+        tsne : random_state=42
+
     Args:
         embeddings: (N, D) array.
         method: one of 'umap', 'tsne', 'pca'.
@@ -156,61 +165,74 @@ def _reduce(embeddings: np.ndarray, method: str = "umap", n_components: int = 2,
     """
     method = method.lower()
     if method == "pca":
-        reducer = PCA(n_components=n_components, **kwargs)
+        params = {"random_state": 0, **kwargs}
+        reducer = PCA(n_components=n_components, **params)
     elif method == "tsne":
-        reducer = TSNE(n_components=n_components, **kwargs)
+        params = {"random_state": 42, **kwargs}
+        reducer = TSNE(n_components=n_components, **params)
     elif method == "umap":
         try:
             from umap import UMAP
         except ImportError:
             raise ImportError("umap-learn is required for UMAP. Install with: pip install umap-learn")
-        reducer = UMAP(n_components=n_components, **kwargs)
+        params = {"n_neighbors": 75, "min_dist": 0.3, "random_state": 42, **kwargs}
+        reducer = UMAP(n_components=n_components, **params)
     else:
         raise ValueError(f"Unknown method '{method}'. Choose from 'pca', 'tsne', 'umap'.")
     return reducer.fit_transform(embeddings)
 
 
+def _scatter_2d(df: pd.DataFrame, x: str, y: str, color_by: str | None,
+                hover: list[str] | None, title: str, width: int, height: int,
+                save_path: str | None):
+    """Interactive 2-D scatter via plotly express (shared by the visualize_* fns).
 
-# 1.  predict
-def predict(
-    checkpoint_path: str,
-    data_path: str,
-    mode: str = "eval",
-    device: str = "cuda",
-    batch_size: int = 32,
-    num_workers: int = 4,
-    fasta_path: str | None = None,
-    esmc_cache: str | None = None,
-) -> dict:
+    Categorical `color_by` gets a frequency-ordered legend and a large qualitative
+    palette (scales past 20 categories); numeric `color_by` uses a continuous scale.
+    Returns the plotly Figure.
     """
-    Run the trained model on a dataset and collect all outputs.
+    import plotly.express as px
 
-    Args:
-        checkpoint_path: path to the .ckpt file.
-        data_path: path to a parquet file with the same schema as training data.
-        mode: 'eval'      — use context/target split (context_ratio from config) so
-                             predictions and losses can be evaluated.
-              'inference'  — all detected proteins become context (context_ratio=1.0).
-                             No targets, but SST embeddings capture the full proteome.
-        device: torch device string (e.g. 'cuda', 'cuda:0', 'cpu').
-        batch_size: batch size for the dataloader.
-        num_workers: number of dataloader workers.
-        fasta_path: path to FASTA file for ESM-C embeddings. Defaults to checkpoint config.
-        esmc_cache: path to precomputed ESM-C embeddings (.pt). Defaults to checkpoint config.
+    kwargs = dict(x=x, y=y, title=title, width=width, height=height,
+                  hover_data=hover or None)
+    if color_by is not None:
+        kwargs["color"] = color_by
+        is_categorical = not pd.api.types.is_numeric_dtype(df[color_by])
+        if is_categorical:
+            order = df[color_by].astype(str).value_counts().index.tolist()
+            palette = px.colors.qualitative.Dark24 + px.colors.qualitative.Light24
+            df = df.copy()
+            df[color_by] = df[color_by].astype(str)
+            kwargs["category_orders"] = {color_by: order}
+            kwargs["color_discrete_sequence"] = palette[:len(order)]
 
-    Returns:
-        dict with keys:
-            sst_emb            np.ndarray  (N, d_model)    — SST embedding per sample
-            pred_ctx           list[np.ndarray]            — ctx-head predictions per sample (eval mode only)
-            pred_sst           list[np.ndarray]            — sst-head predictions per sample (eval mode only)
-            true_bins          list[np.ndarray]            — ground-truth bins per sample (eval mode only)
-            target_feature_ids list[np.ndarray]            — target protein IDs per sample (eval mode only)
-            sample_ids         list[str]                   — sample identifiers (same order as rows)
-            config             dict                        — full config dict from checkpoint
+    fig = px.scatter(df, **kwargs)
+    fig.update_traces(marker=dict(size=4, opacity=0.7, line=dict(width=0)))
+    fig.update_layout(legend=dict(itemsizing="constant"),
+                      plot_bgcolor="white", paper_bgcolor="white")
+    if save_path:
+        fig.write_html(save_path) if save_path.endswith(".html") else fig.write_image(save_path)
+        log.info(f"Figure saved to {save_path}")
+    fig.show()
+    return fig
+
+
+
+# shared engine
+def _run(checkpoint_path: str, data_path: str, *, eval_mode: bool, device: str,
+         batch_size: int, num_workers: int, fasta_path: str | None,
+         esmc_cache: str | None) -> dict:
+    """Load checkpoint + dataset + model and run the forward pass over the data.
+
+    eval_mode=False → every detected feature is context (the SST summarizes the whole
+                      sample); no targets are held out.
+    eval_mode=True  → context/target split (ratios from the training config), so the
+                      held-out target bins are predicted.
+
+    Returns a dict with 'sst_emb' and 'sample_ids' always, plus the per-sample
+    predictions and aggregate 'metrics' when eval_mode. compute_sst() and predict()
+    shape their public output from this.
     """
-    assert mode in ("eval", "inference"), f"mode must be 'eval' or 'inference', got '{mode}'"
-
-    # load dataset first so we know which proteins are needed
     ckpt = _load_checkpoint(checkpoint_path)
     cfg = ckpt["config"]
     mcfg = cfg["model"]
@@ -231,228 +253,248 @@ def predict(
     # build model with ESM-C embeddings for this dataset's proteins
     model, cfg = build_model_for_dataset(checkpoint_path, ds, device, fasta_path, esmc_cache)
 
-    # collator: in inference mode use all detected proteins as context
-    feature_context_ratio = mcfg["feature_context_ratio"] if mode == "eval" else 1.0
-    group_context_ratio = pg_cfg.get("group_context_ratio", 1.0) if mode == "eval" else 1.0
-    absent_context_ratio = abs_cfg.get("absent_context_ratio", 1.0) if mode == "eval" else 1.0
+    # context ratios: full context (1.0) for SST embeddings, config split for evaluation
     collator = ExpressionCollator(
         num_features=ds.num_features(),
-        feature_context_ratio=feature_context_ratio,
-        group_context_ratio=group_context_ratio,
+        feature_context_ratio=mcfg["feature_context_ratio"] if eval_mode else 1.0,
+        group_context_ratio=pg_cfg.get("group_context_ratio", 1.0) if eval_mode else 1.0,
         input_features=mcfg["input_features"],
         protein_groups_enabled=pg_enabled,
         input_groups=pg_cfg.get("input_groups", 0) if pg_enabled else 0,
         absent_species_enabled=abs_enabled,
         input_absent=abs_cfg.get("input_absent", 0),
-        absent_context_ratio=absent_context_ratio,
+        absent_context_ratio=abs_cfg.get("absent_context_ratio", 1.0) if eval_mode else 1.0,
     )
-    dl = DataLoader(
-        ds, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=True, collate_fn=collator,
-    )
+    dl = DataLoader(ds, batch_size=batch_size, shuffle=False,
+                    num_workers=num_workers, pin_memory=True, collate_fn=collator)
 
-    # run forward in eval mode
-    all_sst = []
-    all_pred_ctx = []
-    all_pred_sst = []
-    all_true_bins = []
-    all_target_ids = []
-
+    all_sst, all_pred_ctx, all_pred_sst, all_true_bins, all_target_ids = [], [], [], [], []
     with torch.no_grad():
-        for batch in tqdm(dl, desc="Inference"):
+        for batch in tqdm(dl, desc="Running model"):
             batch = {k: v.to(device) for k, v in batch.items()}
             out = model(batch)
-
             all_sst.append(out["sst_emb"].cpu().numpy())
-
-            if mode == "eval":
-                for pc, pp, tb, tid in zip(
-                    out["pred_ctx"], out["pred_sst"],
-                    out["true_bins"], out["target_feature_ids"],
-                ):
+            if eval_mode:
+                for pc, pp, tb, tid in zip(out["pred_ctx"], out["pred_sst"],
+                                           out["true_bins"], out["target_feature_ids"]):
                     all_pred_ctx.append(pc.cpu().numpy())
                     all_pred_sst.append(pp.cpu().numpy())
                     all_true_bins.append(tb.cpu().numpy())
                     all_target_ids.append(tid.cpu().numpy())
 
-    result = {
-        "sst_emb":            np.concatenate(all_sst, axis=0),  # (N, d_model)
-        "sample_ids":         sample_ids,
-
-    }
-
-    if mode == "eval":
-        result["pred_ctx"]           = all_pred_ctx
-        result["pred_sst"]           = all_pred_sst
-        result["true_bins"]          = all_true_bins
-        result["target_feature_ids"] = all_target_ids
-
-        # compute aggregate metrics for convenience
+    res = {"sst_emb": np.concatenate(all_sst, axis=0), "sample_ids": sample_ids}
+    if eval_mode:
         all_pc = np.concatenate(all_pred_ctx)
         all_pp = np.concatenate(all_pred_sst)
         all_tb = np.concatenate(all_true_bins)
-        result["metrics"] = {
-            "ctx_mse": float(np.mean((all_pc - all_tb) ** 2)),
-            "sst_mse": float(np.mean((all_pp - all_tb) ** 2)),
-            "ctx_mae": float(np.mean(np.abs(all_pc - all_tb))),
-            "sst_mae": float(np.mean(np.abs(all_pp - all_tb))),
-            "n_predictions": len(all_tb),
-        }
-        log.info(f"Eval metrics: ctx_mse={result['metrics']['ctx_mse']:.4f}, "
-                 f"sst_mse={result['metrics']['sst_mse']:.4f}")
+        res.update(
+            pred_ctx=all_pred_ctx, pred_sst=all_pred_sst,
+            true_bins=all_true_bins, target_feature_ids=all_target_ids,
+            metrics={
+                "ctx_mse": float(np.mean((all_pc - all_tb) ** 2)),
+                "sst_mse": float(np.mean((all_pp - all_tb) ** 2)),
+                "ctx_mae": float(np.mean(np.abs(all_pc - all_tb))),
+                "sst_mae": float(np.mean(np.abs(all_pp - all_tb))),
+                "n_predictions": len(all_tb),
+            },
+        )
+    return res
 
-    log.info(f"Done. SST embeddings shape: {result['sst_emb'].shape}")
-    return result
+
+# 1.  compute_sst  — whole-sample embeddings
+def compute_sst(
+    checkpoint_path: str,
+    data_path: str,
+    device: str = "cuda",
+    batch_size: int = 32,
+    num_workers: int = 4,
+    fasta_path: str | None = None,
+    esmc_cache: str | None = None,
+) -> dict:
+    """Compute the Sample Summary Token (SST) embedding for every sample.
+
+    All detected features are used as context, so each SST embedding summarizes the
+    full sample (proteome/transcriptome). Feed the result straight to visualize_sst().
+
+    Args:
+        checkpoint_path: path to the .ckpt file.
+        data_path: path to a `.h5ad` dataset, or an in-memory AnnData (same protein/gene space as training).
+        device: torch device string ('cuda', 'cuda:0', 'cpu').
+        batch_size / num_workers: dataloader settings.
+        fasta_path / esmc_cache: override the checkpoint config's ESM-C FASTA / cache.
+
+    Returns:
+        dict with:
+            sst_emb     np.ndarray (N, d_model) — one embedding per sample
+            sample_ids  list[str]               — row-aligned sample identifiers
+    """
+    res = _run(checkpoint_path, data_path, eval_mode=False, device=device,
+               batch_size=batch_size, num_workers=num_workers,
+               fasta_path=fasta_path, esmc_cache=esmc_cache)
+    log.info(f"Done. SST embeddings: {res['sst_emb'].shape}")
+    return {"sst_emb": res["sst_emb"], "sample_ids": res["sample_ids"]}
+
+
+# 2.  predict  — masked-bin prediction / evaluation
+def predict(
+    checkpoint_path: str,
+    data_path: str,
+    device: str = "cuda",
+    batch_size: int = 32,
+    num_workers: int = 4,
+    fasta_path: str | None = None,
+    esmc_cache: str | None = None,
+) -> dict:
+    """Predict held-out expression bins (the model's masked-modeling task).
+
+    A fraction of each sample's features is held out as targets (context/target split
+    from the training config) and their expression bins are predicted by both heads.
+    Use compute_sst() instead if you want whole-sample embeddings.
+
+    Args:
+        checkpoint_path: path to the .ckpt file.
+        data_path: path to a `.h5ad` dataset, or an in-memory AnnData (same protein/gene space as training).
+        device: torch device string ('cuda', 'cuda:0', 'cpu').
+        batch_size / num_workers: dataloader settings.
+        fasta_path / esmc_cache: override the checkpoint config's ESM-C FASTA / cache.
+
+    Returns:
+        dict with:
+            sample_ids         list[str]        — sample identifiers
+            pred_ctx           list[np.ndarray] — ctx-head predicted bins, per sample
+            pred_sst           list[np.ndarray] — sst-head predicted bins, per sample
+            true_bins          list[np.ndarray] — ground-truth bins, per sample
+            target_feature_ids list[np.ndarray] — target feature ids, per sample
+            metrics            dict             — ctx_mse, sst_mse, ctx_mae, sst_mae, n_predictions
+    """
+    res = _run(checkpoint_path, data_path, eval_mode=True, device=device,
+               batch_size=batch_size, num_workers=num_workers,
+               fasta_path=fasta_path, esmc_cache=esmc_cache)
+    m = res["metrics"]
+    log.info(f"Eval metrics: ctx_mse={m['ctx_mse']:.4f}, sst_mse={m['sst_mse']:.4f}")
+    return {
+        "sample_ids":         res["sample_ids"],
+        "pred_ctx":           res["pred_ctx"],
+        "pred_sst":           res["pred_sst"],
+        "true_bins":          res["true_bins"],
+        "target_feature_ids": res["target_feature_ids"],
+        "metrics":            res["metrics"],
+    }
 
 
 
-# 2.  visualize_proteins
+def _merge_metadata(df, key, metadata, cols):
+    """Left-join the requested metadata columns onto df by `key` (column or index)."""
+    if metadata is None or not cols:
+        return df
+    md = metadata if key in metadata.columns else metadata.rename_axis(key).reset_index()
+    keep = [key] + [c for c in cols if c in md.columns and c != key]
+    return df.merge(md[keep].drop_duplicates(key), on=key, how="left")
+
+
+# 3.  visualize_proteins
 def visualize_proteins(
     model: ProtGPT | str,
     dataset: ExpressionDataset,
     metadata: pd.DataFrame | None = None,
     color_by: str | None = None,
+    hover: list[str] | None = None,
     method: str = "umap",
-    figsize: tuple = (10, 8),
+    title: str | None = None,
+    width: int = 1100,
+    height: int = 700,
     save_path: str | None = None,
     **reducer_kwargs,
-) -> pd.DataFrame:
-    """
-    Visualize the learned protein embeddings from the model's embedding layer.
-
-    Uses the ExpressionDataset to know which proteins exist and retrieve their
-    learned embeddings from the model.  Metadata is joined via a 'protein_id'
-    column (or index) that should match the protein names in the dataset.
+):
+    """Interactive (plotly) view of the learned protein embeddings (learned-embedding models only).
 
     Args:
         model: a loaded ProtGPT model, or path to a .ckpt file.
-        dataset: a loaded ExpressionDataset (provides protein names and indices).
-        metadata: optional DataFrame with a 'protein_id' column (or index named
-                  'protein_id') matching the protein names in the dataset, plus
-                  the column specified by color_by.  If None, plots without coloring.
-        color_by: column name in metadata to colour the scatter plot by.
-                  Required when metadata is provided.
-        method: dimensionality reduction method ('umap', 'tsne', 'pca').
-        figsize: matplotlib figure size.
-        save_path: if provided, save the figure to this path.
-        **reducer_kwargs: forwarded to the reducer (e.g. n_neighbors for UMAP).
+        dataset: a loaded ExpressionDataset (provides protein names / index order).
+        metadata: optional DataFrame keyed by 'protein_id' (column or index) with annotation columns.
+        color_by: metadata column to colour by (categorical → discrete palette, numeric → continuous).
+        hover: extra metadata columns to show on hover.
+        method: 'umap' | 'tsne' | 'pca' (defaults from _reduce).
+        title / width / height: plot title and size.
+        save_path: '.html' → interactive file, other extensions → static image (needs kaleido).
+        **reducer_kwargs: forwarded to the reducer (e.g. n_neighbors).
 
     Returns:
-        DataFrame with columns: protein_id, dim_1, dim_2, and optionally <color_by>.
+        plotly Figure.
     """
     if isinstance(model, str):
         model, _ = _load_model(model)
 
-    # protein names from the dataset (var_names / accessions, index order)
-    feature_names = list(dataset.feature_names)  # length = num_features
-
-    # extract embeddings: indices 1..num_features in the embedding layer
-    # (index 0 is the padding token, real proteins are 1-indexed)
+    feature_names = list(dataset.feature_names)
     device = next(model.parameters()).device
-    indices = torch.arange(1, len(feature_names) + 1, device=device)
-    emb_weights = model.feature_emb(indices).detach().cpu().numpy()  # (num_features, d_model)
+    indices = torch.arange(1, len(feature_names) + 1, device=device)  # 0 = padding
+    emb_weights = model.feature_emb(indices).detach().cpu().numpy()
 
-    # reduce
     coords = _reduce(emb_weights, method=method, **reducer_kwargs)
+    m = method.upper()
+    x, y = f"{m}_1", f"{m}_2"
+    df = pd.DataFrame({"protein_id": feature_names, x: coords[:, 0], y: coords[:, 1]})
 
-    # build result dataframe
-    result = pd.DataFrame({
-        "protein_id": feature_names,
-        "dim_1": coords[:, 0],
-        "dim_2": coords[:, 1],
-    })
+    wanted = list(dict.fromkeys(([color_by] if color_by else []) + (hover or [])))
+    df = _merge_metadata(df, "protein_id", metadata, wanted)
 
-    # merge metadata if provided
-    if metadata is not None and color_by is not None:
-        # support metadata with protein_id as either a column or the index
-        if "protein_id" not in metadata.columns:
-            metadata = metadata.rename_axis("protein_id").reset_index()
-        result = result.merge(metadata[["protein_id", color_by]], on="protein_id", how="left")
+    hover_cols = ["protein_id"] + [c for c in (hover or []) if c in df.columns]
+    color = color_by if (color_by and color_by in df.columns) else None
+    return _scatter_2d(df, x, y, color, hover_cols,
+                       title or f"Protein embeddings ({m})", width, height, save_path)
 
-    # plot
-    fig, ax = plt.subplots(figsize=figsize)
-    if color_by is not None and color_by in result.columns:
-        for cat in result[color_by].dropna().unique():
-            subset = result[result[color_by] == cat]
-            ax.scatter(subset["dim_1"], subset["dim_2"], label=str(cat), s=10, alpha=0.7)
-        ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize="small", markerscale=2)
-    else:
-        ax.scatter(result["dim_1"], result["dim_2"], s=10, alpha=0.7)
-    ax.set_xlabel("Dimension 1")
-    ax.set_ylabel("Dimension 2")
-    title_suffix = f" colored by {color_by}" if color_by and color_by in result.columns else ""
-    ax.set_title(f"Protein embeddings ({method.upper()}){title_suffix}")
-    plt.tight_layout()
-    if save_path:
-        fig.savefig(save_path, dpi=150, bbox_inches="tight")
-        log.info(f"Figure saved to {save_path}")
-    plt.show()
 
-    return result
-
-# 3.  visualize_proteomes
-def visualize_proteomes(
-    predictions: dict,
+# 4.  visualize_sst
+def visualize_sst(
+    sst: dict,
     metadata: pd.DataFrame | None = None,
     color_by: str | None = None,
+    hover: list[str] | None = None,
     method: str = "umap",
-    figsize: tuple = (10, 8),
+    title: str | None = None,
+    width: int = 1100,
+    height: int = 700,
     save_path: str | None = None,
     **reducer_kwargs,
-) -> pd.DataFrame:
-    """
-    Visualize the learned sample-summary (SST) embeddings produced by predict().
+):
+    """Interactive (plotly) view of the Sample Summary Token (SST) embeddings from compute_sst().
 
     Args:
-        predictions: output dict from predict() — must contain 'sst_emb' and 'sample_ids'.
-        metadata: optional DataFrame with a 'sample_id' column (or index) matching
-                  the sample IDs from the dataset.  If None, plots without coloring.
-        color_by: column name in metadata to colour the scatter plot by.
-                  Required when metadata is provided.
-        method: dimensionality reduction method ('umap', 'tsne', 'pca').
-        figsize: matplotlib figure size.
-        save_path: if provided, save the figure to this path.
-        **reducer_kwargs: forwarded to the reducer.
+        sst: output dict from compute_sst() — must contain 'sst_emb' and 'sample_ids'.
+        metadata: optional DataFrame keyed by 'sample_id' (column or index), e.g. ExpressionDataset.obs.
+        color_by: metadata column to colour by (categorical → discrete palette, numeric → continuous).
+        hover: extra metadata columns to show on hover (e.g. ['tissue', 'acquisition', 'split']).
+        method: 'umap' | 'tsne' | 'pca' (defaults from _reduce).
+        title / width / height: plot title and size.
+        save_path: '.html' → interactive file, other extensions → static image (needs kaleido).
+        **reducer_kwargs: forwarded to the reducer (e.g. n_neighbors=75, min_dist=0.3).
 
     Returns:
-        DataFrame with columns: sample_id, dim_1, dim_2, and optionally <color_by>.
+        plotly Figure.
     """
-    sst_emb = predictions["sst_emb"]         # (N, d_model)
-    sample_ids = predictions["sample_ids"]    # list of str
+    sst_emb = sst["sst_emb"]
+    sample_ids = list(sst["sample_ids"])
 
-    # reduce
     coords = _reduce(sst_emb, method=method, **reducer_kwargs)
+    m = method.upper()
+    x, y = f"{m}_1", f"{m}_2"
+    df = pd.DataFrame({"sample_id": sample_ids, x: coords[:, 0], y: coords[:, 1]})
 
-    # build result dataframe
-    result = pd.DataFrame({
-        "sample_id": sample_ids,
-        "dim_1": coords[:, 0],
-        "dim_2": coords[:, 1],
-    })
+    wanted = list(dict.fromkeys(([color_by] if color_by else []) + (hover or [])))
+    df = _merge_metadata(df, "sample_id", metadata, wanted)
 
-    # merge metadata if provided
-    if metadata is not None and color_by is not None:
-        if "sample_id" not in metadata.columns:
-            metadata = metadata.rename_axis("sample_id").reset_index()
-        result = result.merge(metadata[["sample_id", color_by]], on="sample_id", how="left")
+    hover_cols = ["sample_id"] + [c for c in (hover or []) if c in df.columns]
+    color = color_by if (color_by and color_by in df.columns) else None
+    return _scatter_2d(df, x, y, color, hover_cols,
+                       title or f"SST embeddings ({m})", width, height, save_path)
 
-    # plot
-    fig, ax = plt.subplots(figsize=figsize)
-    if color_by is not None and color_by in result.columns:
-        for cat in result[color_by].dropna().unique():
-            subset = result[result[color_by] == cat]
-            ax.scatter(subset["dim_1"], subset["dim_2"], label=str(cat), s=10, alpha=0.7)
-        ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize="small", markerscale=2)
-    else:
-        ax.scatter(result["dim_1"], result["dim_2"], s=10, alpha=0.7)
-    ax.set_xlabel("Dimension 1")
-    ax.set_ylabel("Dimension 2")
-    title_suffix = f" colored by {color_by}" if color_by and color_by in result.columns else ""
-    ax.set_title(f"Sample-summary (SST) embeddings ({method.upper()}){title_suffix}")
-    plt.tight_layout()
-    if save_path:
-        fig.savefig(save_path, dpi=150, bbox_inches="tight")
-        log.info(f"Figure saved to {save_path}")
-    plt.show()
 
-    return result
+# ── attention-based protein–protein analysis (re-exported from protgpt.attention) ──
+# Imported at the bottom because protgpt.attention imports _load_checkpoint /
+# build_model_for_dataset from this module (avoids a circular import at top).
+from protgpt.attention import (  # noqa: E402
+    attention_map,
+    eval_attention_heads,
+    enrichment_curves,
+    load_ppi_ground_truth,
+)

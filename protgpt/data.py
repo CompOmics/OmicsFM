@@ -40,6 +40,14 @@ def _index_dtype_for(n_var: int):
     return np.uint16 if n_var <= np.iinfo(np.uint16).max else np.uint32
 
 
+def _offsets(lengths) -> np.ndarray:
+    """Build a CSR-style offset array of len(lengths)+1 from per-item lengths."""
+    off = np.zeros(len(lengths) + 1, dtype=np.int64)
+    if len(lengths):
+        np.cumsum(np.asarray(lengths, dtype=np.int64), out=off[1:])
+    return off
+
+
 def _segmented_bins(vals: np.ndarray, lengths: np.ndarray, num_bins: int) -> np.ndarray:
     """Vectorized rank-based binning of many samples at once.
 
@@ -113,25 +121,31 @@ class ExpressionDataset(Dataset):
             of currently-available RAM; otherwise memory-map it.
     """
 
-    def __init__(self, h5ad_path, num_bins=10, detect_groups=False, max_group_size=1,
+    def __init__(self, source, num_bins=10, detect_groups=False, max_group_size=1,
                  cache_dir=None, ram_fraction=0.5):
-        self.h5ad_path = str(h5ad_path)
+        # `source` is a path to a .h5ad OR an in-memory AnnData (autodetected).
+        self._adata = source if isinstance(source, ad.AnnData) else None
+        self.h5ad_path = None if self._adata is not None else str(source)
         self.num_bins = num_bins
         self.detect_groups = detect_groups
         self.max_group_size = max_group_size if detect_groups else 1
         self.ram_fraction = ram_fraction
 
-        self._read_source()  
+        self._read_source()
 
-        cache_dir = cache_dir or self._default_cache_dir()
-        if not self._try_load_cache(cache_dir):
-            self._build_cache(cache_dir)
-            assert self._try_load_cache(cache_dir), "cache build did not produce a loadable cache"
+        if self._adata is not None and cache_dir is None:
+            # ad-hoc AnnData with no cache location → build packed arrays in RAM
+            self._build_cache_inmem()
+        else:
+            cache_dir = cache_dir or self._default_cache_dir()
+            if not self._try_load_cache(cache_dir):
+                self._build_cache(cache_dir)
+                assert self._try_load_cache(cache_dir), "cache build did not produce a loadable cache"
 
     # -- source ---------------------------------------------------------------
 
     def _read_source(self):
-        adata = ad.read_h5ad(self.h5ad_path, backed="r")
+        adata = self._adata if self._adata is not None else ad.read_h5ad(self.h5ad_path, backed="r")
         self.feature_names = list(adata.var_names)   # accessions, index order
         self.sample_ids = list(adata.obs_names)
         self.obs = adata.obs.copy()
@@ -139,7 +153,7 @@ class ExpressionDataset(Dataset):
         self.modality = adata.uns.get("modality", "unknown")
         self._n_features = len(self.feature_names)
         self._n_samples = adata.n_obs
-        if adata.isbacked:
+        if self._adata is None and adata.isbacked:
             adata.file.close()
 
     def num_features(self):
@@ -221,94 +235,105 @@ class ExpressionDataset(Dataset):
             return total_bytes > 2 * 1024**3  # no psutil → mmap anything over 2 GB
         return total_bytes > self.ram_fraction * available
 
-    # -- cache build (streaming over the h5ad) --------------------------------
+    # -- cache build (streams the CSR from a file or an in-memory AnnData) ─────
 
-    def _build_cache(self, cache_dir):
+    def _csr_source(self):
+        """Return (indptr ndarray, data_acc, idx_acc, file_handle).
+
+        data_acc/idx_acc support [s:e] slicing — h5py datasets (file source) or
+        numpy arrays (in-memory AnnData). file_handle is an open h5py.File or None.
+        """
+        if self._adata is not None:
+            X = self._adata.X.tocsr()
+            return X.indptr.astype(np.int64), X.data, X.indices, None
         import h5py
+        f = h5py.File(self.h5ad_path, "r")
+        Xg = f["X"]
+        assert Xg.attrs.get("encoding-type") == "csr_matrix", "X must be CSR"
+        return Xg["indptr"][:], Xg["data"], Xg["indices"], f
 
-        log.info(f"Building cache for {self.h5ad_path} ({self._cache_tag()}) ...")
-        os.makedirs(cache_dir, exist_ok=True)
+    def _pack_blocks(self, indptr, data_acc, idx_acc) -> dict:
+        """Stream the CSR in row blocks → packed cache arrays (binned, ragged)."""
         idx_dtype = _index_dtype_for(self._n_features)
-
         ind_ids_parts, ind_bin_parts, ind_lens = [], [], []
         grp_member_parts, grp_size_parts, grp_bin_parts, grp_counts = [], [], [], []
 
-        with h5py.File(self.h5ad_path, "r") as f:
-            Xg = f["X"]
-            assert Xg.attrs.get("encoding-type") == "csr_matrix", "X must be CSR"
-            indptr = Xg["indptr"][:]
-            data_ds, idx_ds = Xg["data"], Xg["indices"]
-            n = self._n_samples
+        for r0 in tqdm(range(0, self._n_samples, _BUILD_BLOCK), desc="Building cache"):
+            r1 = min(r0 + _BUILD_BLOCK, self._n_samples)
+            s, e = int(indptr[r0]), int(indptr[r1])
+            block_data = np.asarray(data_acc[s:e])
+            block_idx = np.asarray(idx_acc[s:e])
+            lengths = (indptr[r0 + 1:r1 + 1] - indptr[r0:r1]).astype(np.int64)
 
-            for r0 in tqdm(range(0, n, _BUILD_BLOCK), desc="Building cache"):
-                r1 = min(r0 + _BUILD_BLOCK, n)
-                s, e = int(indptr[r0]), int(indptr[r1])
-                block_data = data_ds[s:e]
-                block_idx = idx_ds[s:e]
-                lengths = (indptr[r0 + 1:r1 + 1] - indptr[r0:r1]).astype(np.int64)
+            bins_block = _segmented_bins(block_data, lengths, self.num_bins)
+            ids_block = (block_idx.astype(np.int64) + 1).astype(idx_dtype, copy=False)
 
-                # binning is vectorized across the whole block (both modalities)
-                bins_block = _segmented_bins(block_data, lengths, self.num_bins)
-                ids_block = (block_idx.astype(np.int64) + 1).astype(idx_dtype, copy=False)
+            if not self.detect_groups:
+                ind_ids_parts.append(ids_block)
+                ind_bin_parts.append(bins_block)
+                ind_lens.extend(lengths.tolist())
+                continue
 
-                if not self.detect_groups:
-                    # every detected protein is an individual — no per-row work
-                    ind_ids_parts.append(ids_block)
-                    ind_bin_parts.append(bins_block)
-                    ind_lens.extend(lengths.tolist())
-                    continue
+            local_starts = np.zeros(len(lengths) + 1, dtype=np.int64)
+            np.cumsum(lengths, out=local_starts[1:])
+            for j in range(len(lengths)):
+                a, b = int(local_starts[j]), int(local_starts[j + 1])
+                ind_ids, ind_bins, groups = _split_row_groups(
+                    ids_block[a:b], bins_block[a:b], block_data[a:b], self.max_group_size)
+                ind_ids_parts.append(ind_ids)
+                ind_bin_parts.append(ind_bins)
+                ind_lens.append(len(ind_ids))
+                grp_counts.append(len(groups))
+                for members, gbin in groups:
+                    grp_member_parts.append(members.astype(idx_dtype, copy=False))
+                    grp_size_parts.append(len(members))
+                    grp_bin_parts.append(gbin)
 
-                # groups: per-row formation (proteomics only), reusing block bins/ids
-                local_starts = np.zeros(len(lengths) + 1, dtype=np.int64)
-                np.cumsum(lengths, out=local_starts[1:])
-                for j in range(len(lengths)):
-                    a, b = int(local_starts[j]), int(local_starts[j + 1])
-                    ind_ids, ind_bins, groups = _split_row_groups(
-                        ids_block[a:b], bins_block[a:b], block_data[a:b], self.max_group_size,
-                    )
-                    ind_ids_parts.append(ind_ids)
-                    ind_bin_parts.append(ind_bins)
-                    ind_lens.append(len(ind_ids))
-                    grp_counts.append(len(groups))
-                    for members, gbin in groups:
-                        grp_member_parts.append(members.astype(idx_dtype, copy=False))
-                        grp_size_parts.append(len(members))
-                        grp_bin_parts.append(gbin)
+        arrs = {
+            "ind_feature_ids": (np.concatenate(ind_ids_parts) if ind_ids_parts
+                                else np.zeros(0, idx_dtype)).astype(idx_dtype, copy=False),
+            "ind_bins": (np.concatenate(ind_bin_parts) if ind_bin_parts
+                         else np.zeros(0, np.uint8)).astype(np.uint8, copy=False),
+            "ind_offsets": _offsets(ind_lens),
+        }
+        if self.detect_groups:
+            arrs["grp_members"] = (np.concatenate(grp_member_parts) if grp_member_parts
+                                   else np.zeros(0, idx_dtype)).astype(idx_dtype, copy=False)
+            arrs["grp_member_offsets"] = _offsets(grp_size_parts)
+            arrs["grp_bins"] = np.asarray(grp_bin_parts, dtype=np.uint8)
+            arrs["grp_offsets"] = _offsets(grp_counts)
+        return arrs
 
-        self._save_packed(cache_dir, idx_dtype, ind_ids_parts, ind_bin_parts, ind_lens,
-                          grp_member_parts, grp_size_parts, grp_bin_parts, grp_counts)
+    def _build_packed(self) -> dict:
+        indptr, data_acc, idx_acc, fh = self._csr_source()
+        try:
+            return self._pack_blocks(indptr, data_acc, idx_acc)
+        finally:
+            if fh is not None:
+                fh.close()
 
+    def _build_cache(self, cache_dir):
+        log.info(f"Building cache for {self.h5ad_path} ({self._cache_tag()}) ...")
+        os.makedirs(cache_dir, exist_ok=True)
+        for name, arr in self._build_packed().items():
+            np.save(os.path.join(cache_dir, name + ".npy"), arr)
         with open(os.path.join(cache_dir, "meta.json"), "w") as f:
             json.dump(self._expected_meta(), f, indent=2)
         log.info(f"  Saved cache to {cache_dir}")
 
-    def _save_packed(self, cache_dir, idx_dtype, ind_ids_parts, ind_bin_parts, ind_lens,
-                     grp_member_parts, grp_size_parts, grp_bin_parts, grp_counts):
-        def save(name, arr):
-            np.save(os.path.join(cache_dir, name), arr)
-
-        ind_ids = (np.concatenate(ind_ids_parts) if ind_ids_parts
-                   else np.zeros(0, idx_dtype))
-        ind_bins = (np.concatenate(ind_bin_parts) if ind_bin_parts
-                    else np.zeros(0, np.uint8))
-        ind_offsets = np.zeros(len(ind_lens) + 1, dtype=np.int64)
-        np.cumsum(np.asarray(ind_lens, dtype=np.int64), out=ind_offsets[1:])
-        save("ind_feature_ids.npy", ind_ids.astype(idx_dtype, copy=False))
-        save("ind_bins.npy", ind_bins.astype(np.uint8, copy=False))
-        save("ind_offsets.npy", ind_offsets)
-
+    def _build_cache_inmem(self):
+        """Build packed arrays in RAM (for an ad-hoc AnnData with no cache dir)."""
+        log.info(f"Building in-memory cache from AnnData ({self._cache_tag()}) ...")
+        arrs = self._build_packed()
+        self.ind_feature_ids = arrs["ind_feature_ids"]
+        self.ind_bins = arrs["ind_bins"]
+        self.ind_offsets = np.asarray(arrs["ind_offsets"])
         if self.detect_groups:
-            grp_members = (np.concatenate(grp_member_parts) if grp_member_parts
-                           else np.zeros(0, idx_dtype))
-            grp_member_offsets = np.zeros(len(grp_size_parts) + 1, dtype=np.int64)
-            np.cumsum(np.asarray(grp_size_parts, dtype=np.int64), out=grp_member_offsets[1:])
-            grp_bins = np.asarray(grp_bin_parts, dtype=np.uint8)
-            grp_offsets = np.zeros(len(grp_counts) + 1, dtype=np.int64)
-            np.cumsum(np.asarray(grp_counts, dtype=np.int64), out=grp_offsets[1:])
-            save("grp_members.npy", grp_members.astype(idx_dtype, copy=False))
-            save("grp_member_offsets.npy", grp_member_offsets)
-            save("grp_bins.npy", grp_bins)
-            save("grp_offsets.npy", grp_offsets)
+            self.grp_members = arrs["grp_members"]
+            self.grp_member_offsets = np.asarray(arrs["grp_member_offsets"])
+            self.grp_bins = arrs["grp_bins"]
+            self.grp_offsets = np.asarray(arrs["grp_offsets"])
+        log.info(f"  Built in-memory cache: {self._n_samples} samples")
 
     # -- item access ----------------------------------------------------------
 
