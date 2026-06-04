@@ -59,15 +59,12 @@ Rebuild the transcriptomics data cleanly. Locked decisions:
 - **Metadata:** save per-cell `obs`.
 - **Format:** unified `.h5ad` via `protgpt.convert.save_unified_h5ad`.
 - **Datasets to produce:**
-  1. **Gene-level** — native Ensembl gene ids. Gene set is a config knob:
-     `all_transcripts` (~61k) or `protein_coding` (~19–20k). (Still pick which, or build both.)
-  2. **`protein_mapped` (SUMMED)** — gene→protein projection `X @ P`, UniProt columns.
-     Genes sharing a protein are **summed** into one column. KEEP this.
-  - **DROPPED:** the gene-level "proteome_mapped" variant (keep only proteome-mapped genes,
-    native gene ids). Reason: ~206 of the mapped genes collapse onto already-used proteins
-    (≈200 proteins encoded by ≥2 genes), so that view gives multiple gene columns for one
-    protein with different abundances — ambiguous. Summing (the projection) is the
-    principled way to protein space, so we use that instead.
+  1. **Gene-level "all transcripts"** — native Ensembl gene ids.
+  2. **Protein-mapped** — gene→protein projection `X @ P` (as before; UniProt columns).
+  - Make the gene set a config knob: `all_transcripts | protein_coding | proteome_mapped`
+    so "protein-coding only" is one line away.
+  - **OPEN DECISION:** which gene-level set(s) to actually generate. Current plan:
+    `all_transcripts` + the protein-mapped projection.
 - **Split:** grouped by **project** (`dataset_id`), **no leakage**, 90/5/5, random —
   the proteomics-style "split by project". Replaces the current greedy
   tissue-stratified split.
