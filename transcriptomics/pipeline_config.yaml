@@ -3,8 +3,22 @@
 census_version: "stable" # pins which snapshot of CELLxGene database to querry
 output_dir: transcriptomics/output
 
-# Protein set + order is extracted from this file's columns (UniProt accessions)
-proteomics_reference: data/split_v2/train.parquet
+# Protein set + order is read from this proteomics .h5ad's var_names (UniProt
+# accessions). The gene→protein map and the protein-mapped projection use the
+# exact same protein set + order, so transcriptomics columns line up with the
+# proteomics model.
+proteomics_reference: data/flashlfq_diann/train.h5ad
+
+# Which datasets to build. Each entry is written to its own subdirectory under
+# output_dir (e.g. transcriptomics/output/all_transcripts/expression.h5ad).
+# Every requested dataset is derived from a single Census stream per tissue, so
+# adding one is cheap. Supported gene sets:
+#   all_transcripts  - every Census gene that survives QC, native Ensembl ids
+#   protein_mapped   - gene->protein projection X @ P, UniProt columns (summed;
+#                      directly comparable to the proteomics model's protein space)
+datasets_to_build:
+  - all_transcripts
+  - protein_mapped   # uncomment to also emit the summed protein projection
 
 gene_protein_map:
   cache_path: transcriptomics/gene_protein_map.parquet
@@ -43,9 +57,8 @@ tissues:
 cells_per_tissue: 200000
 sampling_strategy: diversity   # "diversity" (inverse cell-type freq) or "random"
 dtype: uint8                   # uint8, uint16, float16, float32
-compress_output: false         # compressed npz is ~6x smaller but ~30min slower to save
 seed: 42
-workers: 8                     # parallel tissue fetching (each opens its own Census connection)
+workers: 16                     # parallel tissue fetching (each opens its own Census connection)
 
 # Cell quality filters
 qc:
@@ -53,9 +66,12 @@ qc:
   min_umi_per_cell: 500        # remove low-depth cells
   max_mito_fraction: 0.20      # remove dying/damaged cells
 
-# Train/valid/test split (used by split_dataset.py)
+# Train/valid/test split (used by split_dataset.py). Cells are grouped by
+# dataset_id (project) and whole projects are assigned to a split, so no project
+# leaks across splits. The same seed gives the same split for every dataset in
+# datasets_to_build, keeping the gene-level and protein sets cell-aligned.
 split:
-  output_dir: transcriptomics/split
+  output_dir: data/sc_trans
   train_frac: 0.90
   valid_frac: 0.05
   test_frac: 0.05

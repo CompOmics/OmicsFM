@@ -29,7 +29,7 @@ import anndata as ad
 
 log = logging.getLogger(__name__)
 
-CACHE_VERSION = 3  # bumped: ties now broken randomly (was deterministic column order)
+CACHE_VERSION = 4  # bumped: per-block RNG seeding (parallel-safe; changes tie realization)
 _BUILD_BLOCK = 8192  # rows per block when streaming the h5ad during cache build
 
 
@@ -114,6 +114,82 @@ def _split_row_groups(ids: np.ndarray, bins: np.ndarray, vals: np.ndarray,
     return ind_ids, ind_bins, groups
 
 
+# ── per-block cache packing (shared by serial + parallel builds) ──────────────
+
+def _pack_one_block(block_data, block_idx, lengths, num_bins, bin_seed, r0,
+                    detect_groups, max_group_size, n_features) -> dict:
+    """Bin + pack one block of rows. Pure function of its inputs.
+
+    The RNG is seeded from (bin_seed, r0) — the block's absolute start row — so a
+    block's tie-break realization depends only on the block, never on how many
+    rows were processed before it. Serial and parallel builds therefore produce
+    byte-identical caches, and blocks can be built in any order / across processes.
+    """
+    idx_dtype = _index_dtype_for(n_features)
+    block_data = np.asarray(block_data)
+    block_idx = np.asarray(block_idx)
+    lengths = np.asarray(lengths, dtype=np.int64)
+    rng = np.random.default_rng([int(bin_seed), int(r0)])
+
+    bins_block = _segmented_bins(block_data, lengths, num_bins, rng)
+    ids_block = (block_idx.astype(np.int64) + 1).astype(idx_dtype, copy=False)
+
+    if not detect_groups:
+        return {"ind_ids": ids_block, "ind_bins": bins_block,
+                "ind_lens": lengths}
+
+    local_starts = np.zeros(len(lengths) + 1, dtype=np.int64)
+    np.cumsum(lengths, out=local_starts[1:])
+    ind_ids_parts, ind_bin_parts, ind_lens = [], [], []
+    grp_member_parts, grp_size_parts, grp_bin_parts, grp_counts = [], [], [], []
+    for j in range(len(lengths)):
+        a, b = int(local_starts[j]), int(local_starts[j + 1])
+        ind_ids, ind_bins, groups = _split_row_groups(
+            ids_block[a:b], bins_block[a:b], block_data[a:b], max_group_size)
+        ind_ids_parts.append(ind_ids)
+        ind_bin_parts.append(ind_bins)
+        ind_lens.append(len(ind_ids))
+        grp_counts.append(len(groups))
+        for members, gbin in groups:
+            grp_member_parts.append(members.astype(idx_dtype, copy=False))
+            grp_size_parts.append(len(members))
+            grp_bin_parts.append(gbin)
+
+    return {
+        "ind_ids": (np.concatenate(ind_ids_parts) if ind_ids_parts
+                    else np.zeros(0, idx_dtype)),
+        "ind_bins": (np.concatenate(ind_bin_parts) if ind_bin_parts
+                     else np.zeros(0, np.uint8)),
+        "ind_lens": np.asarray(ind_lens, dtype=np.int64),
+        "grp_members": (np.concatenate(grp_member_parts) if grp_member_parts
+                        else np.zeros(0, idx_dtype)),
+        "grp_sizes": np.asarray(grp_size_parts, dtype=np.int64),
+        "grp_bins": np.asarray(grp_bin_parts, dtype=np.uint8),
+        "grp_counts": np.asarray(grp_counts, dtype=np.int64),
+    }
+
+
+def _pack_block_worker(args: tuple) -> dict:
+    """Process-pool entry point: open the h5ad, read one block's slice, pack it.
+
+    Each worker opens its own h5py handle (handles can't cross processes) and
+    reads only its row range, so HDF5 gzip-decompression of disjoint blocks runs
+    in parallel — the main win for large caches.
+    """
+    (h5ad_path, r0, r1, num_bins, bin_seed, detect_groups,
+     max_group_size, n_features) = args
+    import h5py
+    with h5py.File(h5ad_path, "r") as f:
+        Xg = f["X"]
+        indptr = Xg["indptr"][r0:r1 + 1]
+        s, e = int(indptr[0]), int(indptr[-1])
+        block_data = Xg["data"][s:e]
+        block_idx = Xg["indices"][s:e]
+    lengths = np.diff(indptr.astype(np.int64))
+    return _pack_one_block(block_data, block_idx, lengths, num_bins, bin_seed, r0,
+                           detect_groups, max_group_size, n_features)
+
+
 # ── dataset ──────────────────────────────────────────────────────────────────
 
 class ExpressionDataset(Dataset):
@@ -131,7 +207,7 @@ class ExpressionDataset(Dataset):
     """
 
     def __init__(self, source, num_bins=10, detect_groups=False, max_group_size=1,
-                 cache_dir=None, ram_fraction=0.5, bin_seed=0):
+                 cache_dir=None, ram_fraction=0.5, bin_seed=0, build_workers=1):
         # `source` is a path to a .h5ad OR an in-memory AnnData (autodetected).
         self._adata = source if isinstance(source, ad.AnnData) else None
         self.h5ad_path = None if self._adata is not None else str(source)
@@ -140,6 +216,10 @@ class ExpressionDataset(Dataset):
         self.max_group_size = max_group_size if detect_groups else 1
         self.ram_fraction = ram_fraction
         self.bin_seed = bin_seed  # seeds the random tie-break in binning (frozen into the cache)
+        # parallel cache build: >1 fans blocks across processes (file source only).
+        # Does NOT affect the resulting cache (blocks are seeded independently), so
+        # it isn't part of the cache fingerprint.
+        self.build_workers = max(1, int(build_workers))
 
         self._read_source()
 
@@ -263,66 +343,65 @@ class ExpressionDataset(Dataset):
         assert Xg.attrs.get("encoding-type") == "csr_matrix", "X must be CSR"
         return Xg["indptr"][:], Xg["data"], Xg["indices"], f
 
-    def _pack_blocks(self, indptr, data_acc, idx_acc) -> dict:
-        """Stream the CSR in row blocks → packed cache arrays (binned, ragged)."""
-        idx_dtype = _index_dtype_for(self._n_features)
-        ind_ids_parts, ind_bin_parts, ind_lens = [], [], []
-        grp_member_parts, grp_size_parts, grp_bin_parts, grp_counts = [], [], [], []
-        rng = np.random.default_rng(self.bin_seed)  # one stream for the whole build (reproducible)
+    def _block_ranges(self) -> list[tuple[int, int]]:
+        return [(r0, min(r0 + _BUILD_BLOCK, self._n_samples))
+                for r0 in range(0, self._n_samples, _BUILD_BLOCK)]
 
-        for r0 in tqdm(range(0, self._n_samples, _BUILD_BLOCK), desc="Building cache"):
-            r1 = min(r0 + _BUILD_BLOCK, self._n_samples)
-            s, e = int(indptr[r0]), int(indptr[r1])
-            block_data = np.asarray(data_acc[s:e])
-            block_idx = np.asarray(idx_acc[s:e])
-            lengths = (indptr[r0 + 1:r1 + 1] - indptr[r0:r1]).astype(np.int64)
-
-            bins_block = _segmented_bins(block_data, lengths, self.num_bins, rng)
-            ids_block = (block_idx.astype(np.int64) + 1).astype(idx_dtype, copy=False)
-
-            if not self.detect_groups:
-                ind_ids_parts.append(ids_block)
-                ind_bin_parts.append(bins_block)
-                ind_lens.extend(lengths.tolist())
-                continue
-
-            local_starts = np.zeros(len(lengths) + 1, dtype=np.int64)
-            np.cumsum(lengths, out=local_starts[1:])
-            for j in range(len(lengths)):
-                a, b = int(local_starts[j]), int(local_starts[j + 1])
-                ind_ids, ind_bins, groups = _split_row_groups(
-                    ids_block[a:b], bins_block[a:b], block_data[a:b], self.max_group_size)
-                ind_ids_parts.append(ind_ids)
-                ind_bin_parts.append(ind_bins)
-                ind_lens.append(len(ind_ids))
-                grp_counts.append(len(groups))
-                for members, gbin in groups:
-                    grp_member_parts.append(members.astype(idx_dtype, copy=False))
-                    grp_size_parts.append(len(members))
-                    grp_bin_parts.append(gbin)
-
-        arrs = {
-            "ind_feature_ids": (np.concatenate(ind_ids_parts) if ind_ids_parts
-                                else np.zeros(0, idx_dtype)).astype(idx_dtype, copy=False),
-            "ind_bins": (np.concatenate(ind_bin_parts) if ind_bin_parts
-                         else np.zeros(0, np.uint8)).astype(np.uint8, copy=False),
-            "ind_offsets": _offsets(ind_lens),
-        }
-        if self.detect_groups:
-            arrs["grp_members"] = (np.concatenate(grp_member_parts) if grp_member_parts
-                                   else np.zeros(0, idx_dtype)).astype(idx_dtype, copy=False)
-            arrs["grp_member_offsets"] = _offsets(grp_size_parts)
-            arrs["grp_bins"] = np.asarray(grp_bin_parts, dtype=np.uint8)
-            arrs["grp_offsets"] = _offsets(grp_counts)
-        return arrs
-
-    def _build_packed(self) -> dict:
+    def _pack_blocks_serial(self, block_ranges) -> list[dict]:
+        """Build each block in-process, streaming the CSR from file or AnnData."""
         indptr, data_acc, idx_acc, fh = self._csr_source()
         try:
-            return self._pack_blocks(indptr, data_acc, idx_acc)
+            blocks = []
+            for r0, r1 in tqdm(block_ranges, desc="Building cache"):
+                s, e = int(indptr[r0]), int(indptr[r1])
+                lengths = (indptr[r0 + 1:r1 + 1] - indptr[r0:r1]).astype(np.int64)
+                blocks.append(_pack_one_block(
+                    np.asarray(data_acc[s:e]), np.asarray(idx_acc[s:e]), lengths,
+                    self.num_bins, self.bin_seed, r0,
+                    self.detect_groups, self.max_group_size, self._n_features))
+            return blocks
         finally:
             if fh is not None:
                 fh.close()
+
+    def _pack_blocks_parallel(self, block_ranges) -> list[dict]:
+        """Build blocks across processes (file source). pool.map preserves order."""
+        from concurrent.futures import ProcessPoolExecutor
+        args = [(self.h5ad_path, r0, r1, self.num_bins, self.bin_seed,
+                 self.detect_groups, self.max_group_size, self._n_features)
+                for r0, r1 in block_ranges]
+        with ProcessPoolExecutor(max_workers=self.build_workers) as pool:
+            return list(tqdm(pool.map(_pack_block_worker, args),
+                             total=len(args),
+                             desc=f"Building cache ({self.build_workers} workers)"))
+
+    def _combine_blocks(self, blocks: list[dict]) -> dict:
+        """Concatenate per-block packed arrays (in block order) into cache arrays."""
+        idx_dtype = _index_dtype_for(self._n_features)
+
+        def cat(key, empty_dtype):
+            parts = [b[key] for b in blocks if len(b[key])]
+            return np.concatenate(parts) if parts else np.zeros(0, empty_dtype)
+
+        arrs = {
+            "ind_feature_ids": cat("ind_ids", idx_dtype).astype(idx_dtype, copy=False),
+            "ind_bins": cat("ind_bins", np.uint8).astype(np.uint8, copy=False),
+            "ind_offsets": _offsets(cat("ind_lens", np.int64)),
+        }
+        if self.detect_groups:
+            arrs["grp_members"] = cat("grp_members", idx_dtype).astype(idx_dtype, copy=False)
+            arrs["grp_member_offsets"] = _offsets(cat("grp_sizes", np.int64))
+            arrs["grp_bins"] = cat("grp_bins", np.uint8).astype(np.uint8, copy=False)
+            arrs["grp_offsets"] = _offsets(cat("grp_counts", np.int64))
+        return arrs
+
+    def _build_packed(self) -> dict:
+        block_ranges = self._block_ranges()
+        parallel = (self.build_workers > 1 and self.h5ad_path is not None
+                    and len(block_ranges) > 1)
+        blocks = (self._pack_blocks_parallel(block_ranges) if parallel
+                  else self._pack_blocks_serial(block_ranges))
+        return self._combine_blocks(blocks)
 
     def _build_cache(self, cache_dir):
         log.info(f"Building cache for {self.h5ad_path} ({self._cache_tag()}) ...")

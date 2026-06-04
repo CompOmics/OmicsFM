@@ -31,11 +31,11 @@ def load_config(path: str) -> dict:
 
 
 def load_dataset(path: str, num_bins: int, detect_groups: bool = False,
-                 max_group_size: int = 1) -> ExpressionDataset:
+                 max_group_size: int = 1, build_workers: int = 1) -> ExpressionDataset:
     """Load a unified .h5ad source as an ExpressionDataset (builds its cache if needed)."""
     log.info(f"Loading {path} ...")
     ds = ExpressionDataset(path, num_bins=num_bins, detect_groups=detect_groups,
-                           max_group_size=max_group_size)
+                           max_group_size=max_group_size, build_workers=build_workers)
     log.info(f"  → {len(ds)} samples, {ds.num_features()} features ({ds.modality})\n")
     return ds
 
@@ -79,10 +79,12 @@ def train(config_path: str):
     detect_groups = dcfg.get("detect_groups", False)
     # max_group_size>1 only when groups are modeled; otherwise grouped proteins are dropped
     max_group_size = pg_cfg.get("max_group_size", 1) if pg_enabled else 1
+    # parallel cache build (one-time); does not affect the cache contents
+    build_workers = dcfg.get("cache_build_workers", 1)
 
-    train_ds = load_dataset(dcfg["train_path"], dcfg["num_bins"], detect_groups, max_group_size)
-    valid_ds = load_dataset(dcfg["valid_path"], dcfg["num_bins"], detect_groups, max_group_size)
-    test_ds  = load_dataset(dcfg["test_path"],  dcfg["num_bins"], detect_groups, max_group_size)
+    train_ds = load_dataset(dcfg["train_path"], dcfg["num_bins"], detect_groups, max_group_size, build_workers)
+    valid_ds = load_dataset(dcfg["valid_path"], dcfg["num_bins"], detect_groups, max_group_size, build_workers)
+    test_ds  = load_dataset(dcfg["test_path"],  dcfg["num_bins"], detect_groups, max_group_size, build_workers)
     feature_names = train_ds.feature_names
 
     if train_ds.modality == "transcriptomics" and pg_enabled:

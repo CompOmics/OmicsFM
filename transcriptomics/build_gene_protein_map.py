@@ -5,7 +5,7 @@ Uses mygene.info as primary source (fast, separates Swiss-Prot/TrEMBL),
 with UniProt bulk download as fallback for unmapped genes.
 
 Only keeps genes that map to proteins present in our proteomics model
-(i.e., columns in the training parquet).
+(i.e., the var_names of the proteomics training .h5ad).
 
 Output: transcriptomics/gene_protein_map.parquet
     Columns: ensembl_gene_id, uniprot_accession, gene_symbol, reviewed
@@ -28,12 +28,22 @@ log = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parent.parent
 
 
-def get_model_proteins(parquet_path: str) -> set[str]:
-    """Load UniProt accessions used as columns in our proteomics data."""
-    df = pd.read_parquet(parquet_path, columns=["pxd_accession"])  # minimal read
-    all_cols = pd.read_parquet(parquet_path).columns.tolist()
-    prots = {c for c in all_cols if c not in ("pxd_accession", "run_name")}
-    log.info(f"Model proteome: {len(prots)} proteins")
+def get_model_proteins(proteomics_path: str) -> set[str]:
+    """Load the UniProt accessions the proteomics model is trained on.
+
+    Reads them from a unified `.h5ad`'s var_names (the current format), or from a
+    legacy dense parquet's columns (older format) for backward compatibility.
+    """
+    path = str(proteomics_path)
+    if path.endswith(".h5ad"):
+        import anndata as ad
+        adata = ad.read_h5ad(path, backed="r")  # var_names only, no X load
+        prots = {str(v) for v in adata.var_names}
+        adata.file.close()
+    else:  # legacy dense parquet
+        all_cols = pd.read_parquet(path).columns.tolist()
+        prots = {c for c in all_cols if c not in ("pxd_accession", "run_name")}
+    log.info(f"Model proteome: {len(prots)} proteins from {Path(path).name}")
     return prots
 
 
@@ -153,8 +163,8 @@ def select_best_accession(entries: list[dict], model_proteins: set[str]) -> dict
     return entries[0] if entries else None
 
 
-def build_mapping(parquet_path: str, output_path: str):
-    model_proteins = get_model_proteins(parquet_path)
+def build_mapping(proteomics_path: str, output_path: str):
+    model_proteins = get_model_proteins(proteomics_path)
 
     # Get gene list from Census
     var_df = get_census_gene_ids()
@@ -206,12 +216,12 @@ def build_mapping(parquet_path: str, output_path: str):
 
 def main():
     parser = argparse.ArgumentParser(description="Build Ensembl→UniProt gene-protein mapping")
-    parser.add_argument("--parquet", default=str(ROOT / "data/split_v2/train.parquet"),
-                        help="Path to proteomics training parquet (for model protein list)")
+    parser.add_argument("--proteomics", default=str(ROOT / "data/flashlfq_diann/train.h5ad"),
+                        help="Proteomics training .h5ad (or legacy parquet) for the model protein list")
     parser.add_argument("--output", default=str(ROOT / "transcriptomics/gene_protein_map.parquet"),
                         help="Output path for the mapping table")
     args = parser.parse_args()
-    build_mapping(args.parquet, args.output)
+    build_mapping(args.proteomics, args.output)
 
 
 if __name__ == "__main__":

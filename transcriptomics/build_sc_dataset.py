@@ -1,11 +1,18 @@
 """
-Build single-cell transcriptomics dataset from CELLxGENE Census.
+Build single-cell transcriptomics dataset(s) from CELLxGENE Census.
 
 Config-driven, sparse throughout. No dense intermediaries.
 
+One Census stream per tissue feeds every requested dataset (`datasets_to_build`):
+each tissue's QC'd gene matrix is derived into all requested gene sets at once
+(all_transcripts / protein_mapped), so adding a dataset costs almost nothing.
+Each dataset is written to its own subdirectory under output_dir.
+
+Splitting into train/valid/test is NOT done here — it lives in split_dataset.py.
+
 Usage:
-    python transcriptomics/build_sc_dataset.py --config transcriptomics/pipeline_config.json
-    python transcriptomics/build_sc_dataset.py --config transcriptomics/pipeline_config.json --test
+    python transcriptomics/build_sc_dataset.py --config transcriptomics/pipeline_config.yaml
+    python transcriptomics/build_sc_dataset.py --config transcriptomics/pipeline_config.yaml --test
 """
 
 import argparse
@@ -67,26 +74,40 @@ META_COLUMNS = [
     "self_reported_ethnicity", "raw_sum", "nnz",
 ]
 
+# Supported gene sets (values for `datasets_to_build`):
+#   all_transcripts  - every Census gene that survives QC, native Ensembl ids
+#   protein_mapped   - gene->protein projection X @ P, UniProt columns (summed)
+GENE_SET_MODES = ("all_transcripts", "protein_mapped")
+
 
 # ── Gene-Protein Map ────────────────────────────────────────────────────
 
 
 @dataclass
 class GeneProteinMap:
-    """Holds the gene→protein mapping and sparse projection matrix."""
-    protein_columns: list[str]          # sorted UniProt accessions (projected output columns)
+    """Holds the gene→protein mapping, the projection matrix, and column orders.
+
+    Census genes are columns of the streamed matrix in `census_var_df` row order.
+    The column lists below name the output columns for each gene set.
+    """
+    protein_columns: list[str]          # sorted UniProt accessions (protein_mapped columns)
     projection: csr_matrix              # (n_census_genes × n_proteins), for X @ P
     mt_gene_indices: np.ndarray         # Census gene indices for mitochondrial genes
     census_var_df: pd.DataFrame         # Census gene metadata (feature_id, feature_name)
-    gene_columns: list[str]             # Ensembl gene ids of mapped genes (no-projection output columns)
-    mapped_gene_indices: np.ndarray     # Census gene indices that map to a model protein
+    all_gene_columns: list[str]         # Ensembl ids of all Census genes (all_transcripts columns)
+
+    def columns_for(self, mode: str) -> list[str]:
+        return {
+            "all_transcripts": self.all_gene_columns,
+            "protein_mapped": self.protein_columns,
+        }[mode]
 
 
-def get_model_proteins(parquet_path: str) -> list[str]:
-    """Extract sorted UniProt accessions from proteomics training data columns."""
-    cols = pd.read_parquet(ROOT / parquet_path, columns=None).columns.tolist()
-    prots = sorted(c for c in cols if c not in ("pxd_accession", "run_name"))
-    log.info(f"Model proteome: {len(prots)} proteins from {parquet_path}")
+def get_model_proteins(proteomics_reference: str) -> list[str]:
+    """Sorted UniProt accessions the proteomics model uses (its h5ad var_names)."""
+    from transcriptomics.build_gene_protein_map import get_model_proteins as _read
+    prots = sorted(_read(str(ROOT / proteomics_reference)))
+    log.info(f"Model proteome: {len(prots)} proteins from {proteomics_reference}")
     return prots
 
 
@@ -101,15 +122,17 @@ def ensure_gene_protein_map(config: dict, census) -> GeneProteinMap:
         log.info("Building gene→protein mapping (this may take a few minutes)...")
         from transcriptomics.build_gene_protein_map import build_mapping
         build_mapping(
-            parquet_path=str(ROOT / config["proteomics_reference"]),
+            proteomics_path=str(ROOT / config["proteomics_reference"]),
             output_path=str(cache_path),
         )
 
-    # Load mapping
+    # Load the full gene→protein mapping. We do NOT use the cached `in_model`
+    # flag (it reflects whichever proteomics reference built the map); instead we
+    # re-check each gene's protein against the current protein set below, so the
+    # map stays correct even if proteomics_reference changes without a rebuild.
     map_df = pd.read_parquet(cache_path)
-    map_df = map_df[map_df["in_model"] == True]
     ensg_to_protein = dict(zip(map_df["ensembl_gene_id"], map_df["uniprot_accession"]))
-    log.info(f"Gene→protein map: {len(ensg_to_protein)} genes → model proteins")
+    log.info(f"Gene→protein map: {len(ensg_to_protein)} genes with a UniProt accession")
 
     # Get model protein columns
     protein_columns = get_model_proteins(config["proteomics_reference"])
@@ -146,12 +169,12 @@ def ensure_gene_protein_map(config: dict, census) -> GeneProteinMap:
     ).tocsr()
     log.info(f"Projection matrix: {projection.shape}, {projection.nnz} mappings")
 
-    # Gene-level (no-projection) output columns: the mapped genes, by Ensembl id.
-    # `rows` already holds each mapped gene index exactly once, in ascending order.
-    mapped_gene_indices = np.array(rows, dtype=np.int64)
+    # all_transcripts columns: every Census gene, by Ensembl id. Census genes are
+    # columns in var_df row order, so feat_ids[j] names column j of the matrix.
     feat_ids = var_df["feature_id"].str.split(".").str[0].values
-    gene_columns = feat_ids[mapped_gene_indices].tolist()
-    log.info(f"Mapped genes (no-projection columns): {len(gene_columns)}")
+    all_gene_columns = feat_ids.tolist()
+    log.info(f"Genes: {len(all_gene_columns)} total (all_transcripts), "
+             f"{len(set(rows))} mapped to model proteins (protein_mapped)")
 
     # Identify mitochondrial gene indices (by gene symbol prefix)
     mt_mask = var_df["feature_name"].str.startswith("MT-", na=False)
@@ -163,8 +186,7 @@ def ensure_gene_protein_map(config: dict, census) -> GeneProteinMap:
         projection=projection,
         mt_gene_indices=mt_gene_indices,
         census_var_df=var_df,
-        gene_columns=gene_columns,
-        mapped_gene_indices=mapped_gene_indices,
+        all_gene_columns=all_gene_columns,
     )
 
 
@@ -231,7 +253,12 @@ def fetch_and_process_tissue(
     census, tissue: str, config: dict, gene_map: GeneProteinMap,
     parallel: bool = False,
 ) -> tuple[csr_matrix, pd.DataFrame] | None:
-    """Fetch, sample, QC, and translate one tissue. Returns (sparse_protein_matrix, metadata)."""
+    """Fetch, sample and QC one tissue.
+
+    Returns (X_census, obs_df): the QC'd sparse gene matrix (all Census genes,
+    float32 raw counts) and its per-cell metadata. Derivation into the requested
+    gene sets happens afterwards in `derive_dataset`.
+    """
     import tiledbsoma
 
     t0 = time.time()
@@ -332,110 +359,54 @@ def fetch_and_process_tissue(
         log.info(f"  [{tissue}] No cells survived QC, skipping")
         return None
 
-    # Step 5: either project genes → proteins, or keep mapped genes (native gene ids)
-    if config.get("project_to_proteins", True):
-        X_out = X_census @ gene_map.projection                  # gene→protein (sums genes per protein)
-        unit = "proteins"
-    else:
-        X_out = X_census[:, gene_map.mapped_gene_indices].tocsr()  # keep mapped genes, gene ids
-        unit = "genes"
-    del X_census
-
-    # Step 6: Cast dtype
-    dtype_name = config.get("dtype", "uint8")
-    dtype = DTYPE_MAP[dtype_name]
-    max_val = DTYPE_MAX[dtype_name]
-
-    if np.issubdtype(dtype, np.integer):
-        X_out.data = np.clip(X_out.data, 0, max_val).astype(dtype)
-    else:
-        X_out.data = X_out.data.astype(dtype)
-
-    # Eliminate zeros that may have been introduced
-    X_out.eliminate_zeros()
-
-    log.info(f"  [{tissue}] Done: {X_out.shape[0]:,} cells × {X_out.shape[1]:,} {unit}, "
-             f"nnz={X_out.nnz:,}, dtype={dtype_name} ({time.time()-t0:.1f}s)")
-
-    return X_out, obs_df
+    log.info(f"  [{tissue}] Done: {X_census.shape[0]:,} cells × {X_census.shape[1]:,} genes, "
+             f"nnz={X_census.nnz:,} ({time.time()-t0:.1f}s)")
+    return X_census, obs_df
 
 
-# ── Split & Reorder ──────────────────────────────────────────────────────
+# ── Derive gene sets from the streamed Census matrix ───────────────────────
 
 
-def _split_and_reorder(
-    X: csr_matrix, meta: pd.DataFrame, split_cfg: dict, seed: int,
-) -> tuple[csr_matrix, pd.DataFrame, dict]:
-    """Split by dataset_id and reorder rows as [train, valid, test].
+def _cast_sparse(X: csr_matrix, dtype_name: str) -> csr_matrix:
+    """Return a copy of X with data cast to dtype_name (clipped if integer).
 
-    Returns (X_reordered, meta_reordered, split_indices) where split_indices
-    maps split name → [start, end] row range.
+    Always builds a fresh matrix, so the input is never mutated — the same
+    Census matrix can be derived into several gene sets in turn.
     """
-    train_frac = split_cfg.get("train_frac", 0.9)
-    valid_frac = split_cfg.get("valid_frac", 0.05)
+    dtype = DTYPE_MAP[dtype_name]
+    if np.issubdtype(dtype, np.integer):
+        data = np.clip(X.data, 0, DTYPE_MAX[dtype_name]).astype(dtype)
+    else:
+        data = X.data.astype(dtype)
+    out = csr_matrix((data, X.indices.copy(), X.indptr.copy()), shape=X.shape)
+    out.eliminate_zeros()
+    return out
 
-    datasets = meta["dataset_id"].unique()
-    rng = np.random.RandomState(seed)
-    rng.shuffle(datasets)
 
-    n = len(datasets)
-    n_train = int(n * train_frac)
-    n_valid = int(n * valid_frac)
+def derive_dataset(X_census: csr_matrix, gene_map: GeneProteinMap,
+                   mode: str, dtype_name: str) -> csr_matrix:
+    """Derive one gene set from the full QC'd Census matrix, cast to dtype_name.
 
-    train_ds = set(datasets[:n_train])
-    valid_ds = set(datasets[n_train:n_train + n_valid])
-    test_ds = set(datasets[n_train + n_valid:])
-
-    ds_col = meta["dataset_id"].values
-    train_mask = np.array([d in train_ds for d in ds_col])
-    valid_mask = np.array([d in valid_ds for d in ds_col])
-    test_mask = np.array([d in test_ds for d in ds_col])
-
-    # Reorder: train rows first, then valid, then test
-    order = np.concatenate([
-        np.where(train_mask)[0],
-        np.where(valid_mask)[0],
-        np.where(test_mask)[0],
-    ])
-
-    X_reordered = X[order]
-    meta_reordered = meta.iloc[order].reset_index(drop=True)
-
-    # Add split column to metadata
-    n_train_rows = int(train_mask.sum())
-    n_valid_rows = int(valid_mask.sum())
-    n_test_rows = int(test_mask.sum())
-
-    split_labels = (
-        ["train"] * n_train_rows +
-        ["valid"] * n_valid_rows +
-        ["test"] * n_test_rows
-    )
-    meta_reordered["split"] = split_labels
-
-    split_indices = {
-        "train": [0, n_train_rows],
-        "valid": [n_train_rows, n_train_rows + n_valid_rows],
-        "test": [n_train_rows + n_valid_rows, n_train_rows + n_valid_rows + n_test_rows],
-    }
-
-    log.info(f"Split by dataset_id ({len(datasets)} datasets → "
-             f"{len(train_ds)} train, {len(valid_ds)} valid, {len(test_ds)} test):")
-    log.info(f"  train: {n_train_rows:,} cells (rows {split_indices['train'][0]}–{split_indices['train'][1]})")
-    log.info(f"  valid: {n_valid_rows:,} cells (rows {split_indices['valid'][0]}–{split_indices['valid'][1]})")
-    log.info(f"  test:  {n_test_rows:,} cells (rows {split_indices['test'][0]}–{split_indices['test'][1]})")
-
-    return X_reordered, meta_reordered, split_indices
+    - all_transcripts : every Census gene (columns = all_gene_columns)
+    - protein_mapped  : gene→protein projection X @ P (sums genes per protein)
+    """
+    if mode == "all_transcripts":
+        X_out = X_census
+    elif mode == "protein_mapped":
+        X_out = (X_census @ gene_map.projection).tocsr()
+    else:
+        raise ValueError(f"Unknown gene set '{mode}'; expected one of {GENE_SET_MODES}")
+    return _cast_sparse(X_out, dtype_name)
 
 
 # ── Save ─────────────────────────────────────────────────────────────────
 
 
 def save_dataset(output_dir: Path, X: csr_matrix, metadata: pd.DataFrame,
-                 protein_columns: list[str], config: dict):
-    """Save the dataset natively as a single unified `expression.h5ad`.
+                 columns: list[str], config: dict):
+    """Save one gene set natively as a unified `expression.h5ad`.
 
-    Bundles the sparse matrix (X), per-cell metadata (obs), and protein/gene
+    Bundles the sparse matrix (X), per-cell metadata (obs), and gene/protein
     accessions (var) in one file — the format consumed by split_dataset.py and
     protgpt.data.ExpressionDataset.
     """
@@ -449,7 +420,7 @@ def save_dataset(output_dir: Path, X: csr_matrix, metadata: pd.DataFrame,
 
     h5ad_path = output_dir / "expression.h5ad"
     log.info(f"Saving {h5ad_path} ({X.shape[0]:,} × {X.shape[1]:,}, nnz={X.nnz:,})...")
-    save_unified_h5ad(str(h5ad_path), X, metadata, protein_columns,
+    save_unified_h5ad(str(h5ad_path), X, metadata, columns,
                       modality="transcriptomics", value_semantics="umi_counts")
     size_mb = h5ad_path.stat().st_size / 1e6
     log.info(f"  Saved expression.h5ad: {size_mb:.1f} MB ({time.time()-t0:.1f}s)")
@@ -463,17 +434,25 @@ def save_dataset(output_dir: Path, X: csr_matrix, metadata: pd.DataFrame,
 # ── Main ─────────────────────────────────────────────────────────────────
 
 
+def _derive_all(X_census: csr_matrix, gene_map: GeneProteinMap,
+                modes: list[str], dtype_name: str) -> dict[str, csr_matrix]:
+    """Derive every requested gene set from one tissue's Census matrix."""
+    return {m: derive_dataset(X_census, gene_map, m, dtype_name) for m in modes}
+
+
 def _process_tissue_worker(args):
-    """Worker function for parallel tissue processing.
+    """Worker for parallel tissue processing: fetch + derive all gene sets.
 
-    Each worker opens its own Census connection since SOMA objects
-    can't be shared across processes.
+    Each worker opens its own Census connection (SOMA objects can't cross
+    processes) and derives the gene sets in-process, so only the (smaller)
+    per-mode matrices are pickled back — not the full Census gene matrix.
+
+    Returns (tissue, {mode: X}, obs_df) or (tissue, None, None) on no/failed result.
     """
-    tissue, config, gene_map = args
+    tissue, config, gene_map, modes, dtype_name = args
 
-    # Re-initialize logging in child process
+    # Re-initialize logging in child process; name it for log clarity
     _setup_logging()
-    # Name the process for log clarity
     multiprocessing.current_process().name = tissue
 
     import cellxgene_census
@@ -481,21 +460,24 @@ def _process_tissue_worker(args):
     try:
         with cellxgene_census.open_soma(census_version=config["census_version"]) as census:
             result = fetch_and_process_tissue(census, tissue, config, gene_map, parallel=True)
-        return tissue, result
+        if result is None:
+            return tissue, None, None
+        X_census, obs_df = result
+        return tissue, _derive_all(X_census, gene_map, modes, dtype_name), obs_df
     except Exception as e:
         log.error(f"[{tissue}] Failed: {e}", exc_info=True)
-        return tissue, None
+        return tissue, None, None
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Build SC transcriptomics dataset")
-    parser.add_argument("--config", required=True, help="Path to pipeline_config.json")
+    parser = argparse.ArgumentParser(description="Build SC transcriptomics dataset(s)")
+    parser.add_argument("--config", required=True, help="Path to pipeline_config.yaml")
     parser.add_argument("--test", action="store_true", help="Test mode: 3 tissues, 1k cells")
     parser.add_argument("--tissues", nargs="+", default=None, help="Override tissue list")
     parser.add_argument("--cells-per-tissue", type=int, default=None, help="Override cells_per_tissue")
     parser.add_argument("--workers", type=int, default=None, help="Override number of parallel workers")
-    parser.add_argument("--no-projection", action="store_true",
-                        help="Keep native Ensembl gene accessions instead of projecting to proteins")
+    parser.add_argument("--datasets", nargs="+", default=None, choices=GENE_SET_MODES,
+                        help="Override datasets_to_build (gene sets to emit)")
     parser.add_argument("--output-dir", default=None, help="Override output_dir from config")
     args = parser.parse_args()
 
@@ -511,10 +493,15 @@ def main():
         config["tissues"] = args.tissues
     if args.cells_per_tissue:
         config["cells_per_tissue"] = args.cells_per_tissue
-    if args.no_projection:
-        config["project_to_proteins"] = False
+    if args.datasets:
+        config["datasets_to_build"] = args.datasets
     if args.output_dir:
         config["output_dir"] = args.output_dir
+
+    modes = config.get("datasets_to_build", ["all_transcripts"])
+    bad = [m for m in modes if m not in GENE_SET_MODES]
+    if bad:
+        parser.error(f"Unknown gene set(s) {bad} in datasets_to_build; expected {GENE_SET_MODES}")
 
     output_dir = ROOT / config["output_dir"]
     tissues = config["tissues"]
@@ -523,6 +510,7 @@ def main():
 
     log.info(f"Config: {len(tissues)} tissues, {config['cells_per_tissue']} cells/tissue, "
              f"dtype={dtype_name}, sampling={config['sampling_strategy']}, workers={n_workers}")
+    log.info(f"Datasets to build: {modes}")
     log.info(f"Output: {output_dir}")
 
     import cellxgene_census
@@ -533,42 +521,43 @@ def main():
     with cellxgene_census.open_soma(census_version=config["census_version"]) as census:
         gene_map = ensure_gene_protein_map(config, census)
 
-    # Process tissues
-    X_blocks = []
+    # Per-mode tissue blocks (aligned: every mode + meta is appended together per
+    # tissue, so all gene sets stay cell-aligned regardless of completion order).
+    X_blocks = {m: [] for m in modes}
     meta_blocks = []
     total_cells = 0
+
+    def collect(tissue_name, derived, meta_tissue):
+        nonlocal total_cells
+        if derived is None:
+            log.info(f"  [{tissue_name}] No result")
+            return
+        for m in modes:
+            X_blocks[m].append(derived[m])
+        meta_blocks.append(meta_tissue)
+        total_cells += len(meta_tissue)
+        mem_mb = sum(
+            b.data.nbytes + b.indices.nbytes + b.indptr.nbytes
+            for blocks in X_blocks.values() for b in blocks
+        ) / 1e6
+        log.info(f"  [{tissue_name}] Collected. Running total: {total_cells:,} cells, {mem_mb:.0f} MB")
 
     if n_workers > 1:
         from concurrent.futures import ProcessPoolExecutor, as_completed
 
         log.info(f"Processing {len(tissues)} tissues with {n_workers} parallel workers...")
-        worker_args = [(tissue, config, gene_map) for tissue in tissues]
+        worker_args = [(tissue, config, gene_map, modes, dtype_name) for tissue in tissues]
 
         with ProcessPoolExecutor(max_workers=n_workers) as pool:
             futures = {pool.submit(_process_tissue_worker, a): a[0] for a in worker_args}
-
             for future in as_completed(futures):
-                tissue = futures[future]
-                tissue_name, result = future.result()
-
-                if result is None:
-                    log.info(f"  [{tissue_name}] No result")
-                    continue
-
-                X_tissue, meta_tissue = result
-                X_blocks.append(X_tissue)
-                meta_blocks.append(meta_tissue)
-                total_cells += X_tissue.shape[0]
-
-                mem_mb = sum(
-                    b.data.nbytes + b.indices.nbytes + b.indptr.nbytes for b in X_blocks
-                ) / 1e6
-                log.info(f"  [{tissue_name}] Collected. Running total: {total_cells:,} cells, {mem_mb:.0f} MB")
+                tissue_name, derived, meta_tissue = future.result()
+                collect(tissue_name, derived, meta_tissue)
     else:
         # Sequential — use a single Census connection
         with cellxgene_census.open_soma(census_version=config["census_version"]) as census:
             for i, tissue in enumerate(tissues, 1):
-                log.info(f"")
+                log.info("")
                 log.info(f"{'='*60}")
                 log.info(f"  Tissue {i}/{len(tissues)}: {tissue}")
                 log.info(f"{'='*60}")
@@ -578,42 +567,35 @@ def main():
                 except Exception as e:
                     log.error(f"  [{tissue}] Failed: {e}", exc_info=True)
                     continue
-
                 if result is None:
                     continue
 
-                X_tissue, meta_tissue = result
-                X_blocks.append(X_tissue)
-                meta_blocks.append(meta_tissue)
-                total_cells += X_tissue.shape[0]
+                X_census, meta_tissue = result
+                collect(tissue, _derive_all(X_census, gene_map, modes, dtype_name), meta_tissue)
+                del X_census
 
-                mem_mb = sum(
-                    b.data.nbytes + b.indices.nbytes + b.indptr.nbytes for b in X_blocks
-                ) / 1e6
-                log.info(f"  Running total: {total_cells:,} cells, {mem_mb:.0f} MB sparse")
+    if not meta_blocks:
+        log.error("No tissues produced data — nothing to save.")
+        return
 
-    # Stack all tissues
-    log.info(f"")
-    log.info(f"Stacking {len(X_blocks)} tissue blocks...")
-    X_all = sparse_vstack(X_blocks, format="csr")
-    del X_blocks
+    # Stack and save each gene set (shared obs across all of them)
     meta_all = pd.concat(meta_blocks, ignore_index=True)
     del meta_blocks
-
-    mem_mb = (X_all.data.nbytes + X_all.indices.nbytes + X_all.indptr.nbytes) / 1e6
-    density = X_all.nnz / (X_all.shape[0] * X_all.shape[1]) * 100
-    log.info(f"Combined: {X_all.shape[0]:,} cells × {X_all.shape[1]:,} proteins, "
-             f"nnz={X_all.nnz:,}, density={density:.2f}%, {mem_mb:.0f} MB")
-
-    # Save (columns are proteins or genes depending on projection mode)
-    columns = (gene_map.protein_columns if config.get("project_to_proteins", True)
-               else gene_map.gene_columns)
-    save_dataset(output_dir, X_all, meta_all, columns, config)
+    for m in modes:
+        log.info("")
+        log.info(f"Stacking {len(X_blocks[m])} tissue blocks for '{m}'...")
+        X_all = sparse_vstack(X_blocks[m], format="csr")
+        X_blocks[m] = None  # free as we go
+        density = X_all.nnz / (X_all.shape[0] * X_all.shape[1]) * 100
+        log.info(f"  '{m}': {X_all.shape[0]:,} cells × {X_all.shape[1]:,} cols, "
+                 f"nnz={X_all.nnz:,}, density={density:.2f}%")
+        save_dataset(output_dir / m, X_all, meta_all, gene_map.columns_for(m), config)
+        del X_all
 
     elapsed = time.time() - t_start
-    log.info(f"")
+    log.info("")
     log.info(f"{'='*60}")
-    log.info(f"  COMPLETE: {total_cells:,} cells in {elapsed:.0f}s")
+    log.info(f"  COMPLETE: {total_cells:,} cells, {len(modes)} dataset(s) in {elapsed:.0f}s")
     log.info(f"{'='*60}")
 
 

@@ -25,6 +25,12 @@ transcriptomics/*.parquet
 wandb/
 *.log
 
+# ── Experiment caches & results (rebuildable / large) ─────────────────────
+.ontocorr_cache/
+.ontocorr_results/
+*.obo
+*.pkl
+
 # ── Python ──────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
@@ -53,3 +59,7 @@ Thumbs.db
 _inspect_*.py
 _scratch*
 *.tmp
+
+
+experiments/*
+config/*
