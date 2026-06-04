@@ -29,7 +29,7 @@ import anndata as ad
 
 log = logging.getLogger(__name__)
 
-CACHE_VERSION = 2  # bumped: feature-axis rename changed cache file names
+CACHE_VERSION = 3  # bumped: ties now broken randomly (was deterministic column order)
 _BUILD_BLOCK = 8192  # rows per block when streaming the h5ad during cache build
 
 
@@ -48,20 +48,28 @@ def _offsets(lengths) -> np.ndarray:
     return off
 
 
-def _segmented_bins(vals: np.ndarray, lengths: np.ndarray, num_bins: int) -> np.ndarray:
-    """Vectorized rank-based binning of many samples at once.
+def _segmented_bins(vals: np.ndarray, lengths: np.ndarray, num_bins: int,
+                    rng: np.random.Generator) -> np.ndarray:
+    """Vectorized rank-based binning of many samples at once, with RANDOM tie-breaking.
 
     `vals` is the concatenation of every sample's detected values in a block;
     `lengths` gives each sample's count. Returns a uint8 array (same length as
     `vals`) of bins in 1..num_bins, where each sample is binned independently by
     within-sample value rank.
 
-    Equivalent to running, per sample,
-        order = argsort(v, kind="stable"); ranks[order] = arange(1, n+1)
-        bins  = ceil(ranks / n * num_bins)
-    but as a single segmented sort over the whole block. A stable lexsort by
-    (sample, value) reproduces the per-sample stable argsort exactly (ties keep
-    original order), so the output matches per-row normalization but faster.
+    Tie-breaking is the critical detail for count data. UMI counts are dominated by
+    ties (~70% of detected genes have count=1), so a sample's bins are decided almost
+    entirely by how equal values are ordered. We break ties **randomly**: tied genes
+    are scattered across the consecutive bins their tie spans with no learnable
+    pattern. A deterministic tie-break (e.g. stable sort → fixed column/gene-id order)
+    would make a gene's bin reproducible across cells, letting the model memorise a
+    non-biological ordering and deflate the loss artificially. Randomising keeps the
+    equal-frequency bin structure (every element still gets a distinct rank 1..n) while
+    turning the irreducible shot noise of tied counts into honest, unpredictable noise.
+
+    `rng` is supplied by the caller so the (frozen, cached) assignment is reproducible
+    for a given seed. The random draw is uncorrelated with anything the model sees, so
+    freezing it at cache-build time is sufficient to remove the artifact.
     """
     n = len(vals)
     if n == 0:
@@ -71,7 +79,8 @@ def _segmented_bins(vals: np.ndarray, lengths: np.ndarray, num_bins: int) -> np.
     starts = np.zeros(n_rows, dtype=np.int64)             # block-local row offsets
     np.cumsum(lengths[:-1], out=starts[1:])
 
-    order = np.lexsort((vals, rows))                      # stable: by sample, then value
+    tie = rng.random(n)                                   # random key → breaks ties unpredictably
+    order = np.lexsort((tie, vals, rows))                # by sample, then value, then random
     within = np.arange(n) - starts[rows[order]]           # 0-based rank within its sample
     ranks = np.empty(n, dtype=np.int64)
     ranks[order] = within + 1                             # scatter back to original order
@@ -122,7 +131,7 @@ class ExpressionDataset(Dataset):
     """
 
     def __init__(self, source, num_bins=10, detect_groups=False, max_group_size=1,
-                 cache_dir=None, ram_fraction=0.5):
+                 cache_dir=None, ram_fraction=0.5, bin_seed=0):
         # `source` is a path to a .h5ad OR an in-memory AnnData (autodetected).
         self._adata = source if isinstance(source, ad.AnnData) else None
         self.h5ad_path = None if self._adata is not None else str(source)
@@ -130,6 +139,7 @@ class ExpressionDataset(Dataset):
         self.detect_groups = detect_groups
         self.max_group_size = max_group_size if detect_groups else 1
         self.ram_fraction = ram_fraction
+        self.bin_seed = bin_seed  # seeds the random tie-break in binning (frozen into the cache)
 
         self._read_source()
 
@@ -188,6 +198,7 @@ class ExpressionDataset(Dataset):
             "num_bins": self.num_bins,
             "detect_groups": self.detect_groups,
             "max_group_size": self.max_group_size,
+            "bin_seed": self.bin_seed,
             "var_names_hash": self._var_names_hash(),
         }
 
@@ -257,6 +268,7 @@ class ExpressionDataset(Dataset):
         idx_dtype = _index_dtype_for(self._n_features)
         ind_ids_parts, ind_bin_parts, ind_lens = [], [], []
         grp_member_parts, grp_size_parts, grp_bin_parts, grp_counts = [], [], [], []
+        rng = np.random.default_rng(self.bin_seed)  # one stream for the whole build (reproducible)
 
         for r0 in tqdm(range(0, self._n_samples, _BUILD_BLOCK), desc="Building cache"):
             r1 = min(r0 + _BUILD_BLOCK, self._n_samples)
@@ -265,7 +277,7 @@ class ExpressionDataset(Dataset):
             block_idx = np.asarray(idx_acc[s:e])
             lengths = (indptr[r0 + 1:r1 + 1] - indptr[r0:r1]).astype(np.int64)
 
-            bins_block = _segmented_bins(block_data, lengths, self.num_bins)
+            bins_block = _segmented_bins(block_data, lengths, self.num_bins, rng)
             ids_block = (block_idx.astype(np.int64) + 1).astype(idx_dtype, copy=False)
 
             if not self.detect_groups:
