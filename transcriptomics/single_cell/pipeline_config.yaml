@@ -1,7 +1,7 @@
 # Transcriptomics Pipeline Configuration
 
 census_version: "stable" # pins which snapshot of CELLxGene database to querry
-output_dir: transcriptomics/output
+output_dir: transcriptomics/single_cell/output
 
 # Protein set + order is read from this proteomics .h5ad's var_names (UniProt
 # accessions). The gene→protein map and the protein-mapped projection use the
@@ -10,7 +10,7 @@ output_dir: transcriptomics/output
 proteomics_reference: data/flashlfq_diann/train.h5ad
 
 # Which datasets to build. Each entry is written to its own subdirectory under
-# output_dir (e.g. transcriptomics/output/all_transcripts/expression.h5ad).
+# output_dir (e.g. transcriptomics/single_cell/output/all_transcripts/expression.h5ad).
 # Every requested dataset is derived from a single Census stream per tissue, so
 # adding one is cheap. Supported gene sets:
 #   all_transcripts  - every Census gene that survives QC, native Ensembl ids
@@ -21,7 +21,7 @@ datasets_to_build:
   - protein_mapped   # uncomment to also emit the summed protein projection
 
 gene_protein_map:
-  cache_path: transcriptomics/gene_protein_map.parquet
+  cache_path: transcriptomics/single_cell/gene_protein_map.parquet
   force_rebuild: false
 
 # CELLxGENE tissue_general values to fetch

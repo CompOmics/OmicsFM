@@ -3,9 +3,9 @@
 data/
 fasta/
 model/
-transcriptomics/output/
-transcriptomics/split/
-transcriptomics/*.parquet
+transcriptomics/*/output/
+transcriptomics/*/split/
+transcriptomics/*/*.parquet
 
 # Generic data/checkpoint extensions, anywhere in the tree
 *.parquet

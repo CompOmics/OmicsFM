@@ -12,12 +12,12 @@ and writes                        split_dir/<mode>/{train,valid,test}.h5ad
 
 Usage:
     # Split every dataset listed in datasets_to_build:
-    python transcriptomics/split_dataset.py --config transcriptomics/pipeline_config.yaml
+    python transcriptomics/single_cell/split_dataset.py --config transcriptomics/single_cell/pipeline_config.yaml
 
     # Split a single expression.h5ad ad hoc:
-    python transcriptomics/split_dataset.py \
-      --expression transcriptomics/output/all_transcripts/expression.h5ad \
-      --output-dir transcriptomics/split/all_transcripts
+    python transcriptomics/single_cell/split_dataset.py \
+      --expression transcriptomics/single_cell/output/all_transcripts/expression.h5ad \
+      --output-dir transcriptomics/single_cell/split/all_transcripts
 """
 
 import argparse
@@ -29,7 +29,7 @@ from pathlib import Path
 import numpy as np
 import yaml
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent.parent.parent  # repo root (transcriptomics/single_cell/ -> protgpt/)
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))  # make `protgpt` importable when run as a script
 
@@ -152,8 +152,8 @@ def main():
 
         _check_fracs(parser, train_frac, valid_frac, test_frac)
 
-        build_dir = Path(cfg.get("output_dir", "transcriptomics/output"))
-        split_dir = Path(split_cfg.get("output_dir", "transcriptomics/split"))
+        build_dir = Path(cfg.get("output_dir", "transcriptomics/single_cell/output"))
+        split_dir = Path(split_cfg.get("output_dir", "transcriptomics/single_cell/split"))
         modes = args.datasets or cfg.get("datasets_to_build", ["all_transcripts"])
 
         log.info(f"Splitting datasets: {modes}")

@@ -1,0 +1,86 @@
+# Bulk Transcriptomics Pipeline Configuration (ARCHS4)
+#
+# Mirrors transcriptomics/single_cell/pipeline_config.yaml, but the source is the
+# ARCHS4 human bulk RNA-seq HDF5 (one giant samples x genes count matrix) instead
+# of CELLxGENE Census. The output contract is identical: one expression.h5ad per
+# gene set (sparse CSR X + obs + var), so the same downstream binning/splitting
+# logic applies.
+
+# ── Source ────────────────────────────────────────────────────────────────
+# Download from https://archs4.org/data — human gene-level counts (raw estimated
+# counts, kallisto). Path is resolved relative to the repo root. Lives under the bulk
+# output dir (gitignored) so all bulk artifacts stay together.
+archs4_h5: transcriptomics/bulk/output/archs4/human_gene_v2.latest.h5
+
+output_dir: transcriptomics/bulk/output
+
+# Protein set + order, read from this proteomics .h5ad's var_names (UniProt
+# accessions) — SAME reference as the single-cell arm, so the protein_mapped
+# projection lines all three FMs up on one protein space.
+proteomics_reference: data/flashlfq_diann/train.h5ad
+
+# Which datasets to build (one subdirectory each under output_dir). Same gene-set
+# semantics as the single-cell arm:
+#   all_transcripts  - every ARCHS4 gene that survives QC, native Ensembl ids
+#   protein_mapped   - gene->protein projection X @ P, UniProt columns (summed)
+datasets_to_build:
+  - all_transcripts
+  # - protein_mapped
+
+gene_protein_map:
+  # Reuse the single-cell arm's cached Ensembl->UniProt map if present (the
+  # mapping is source-agnostic). Rebuild only if ARCHS4 gene ids diverge.
+  cache_path: transcriptomics/single_cell/gene_protein_map.parquet
+  force_rebuild: false
+
+# ── Sample selection ────────────────────────────────────────────────────────
+# Free-text tissue strings in ARCHS4 are noisy. Selection is keyword-based here;
+# canonical tissue labels come from the metadata-harmonization step below.
+# Leave `tissues: null` to take all samples (subject to QC + sample cap).
+tissues: null
+samples_per_tissue: null      # null = no cap; else max samples per harmonized tissue
+exclude_cell_lines: true      # drop Cellosaurus-matched cell-line samples (see metadata step)
+
+dtype: uint32                 # ARCHS4 raw counts exceed uint16 (max ~730k); uint32 = exact, 4 bytes
+chunk_size: 2000              # samples per streamed block (one block held in RAM at a time)
+seed: 42
+
+# Sample quality filters (bulk analogues of the single-cell QC)
+qc:
+  min_genes_per_sample: 5000      # drop shallow / failed libraries
+  min_total_counts: 1000000       # ~1M mapped reads floor
+  require_metadata: true          # drop samples with empty/junk source metadata
+
+# ── Metadata harmonization (agentic-metadata SapBERT normalizer) ─────────────
+# Reuses the proteomics controlled vocabulary so bulk tissue/disease/cell_line
+# labels are aligned to the SAME ontology as the proteomics + single-cell FMs.
+# See ../agentic-metadata/agentic_metadata/normalization/.
+metadata:
+  enabled: true
+  # Manual overrides (raw value -> forced term) live in an easy-to-edit standalone file
+  # next to the scripts: transcriptomics/bulk/manual_overrides.yaml. Set a custom path
+  # here to point elsewhere; otherwise that default file is used.
+  # manual_overrides_file: transcriptomics/bulk/manual_overrides.yaml
+  # MetaSRA join (optional, recommended): pre-curated ontology terms for SRA
+  # samples, joined on GSM/SRS ids. Falls back to SapBERT for misses.
+  metasra_path: null
+  normalization:
+    ontology_dir: ../agentic-metadata/agentic_metadata/ontologies/
+    cache_dir: ../agentic-metadata/agentic_metadata/cache/ontology/
+    similarity_threshold: 0.7
+    use_gpu: true
+    # Fields to harmonize and which vocabulary each maps to. (cell_line is omitted:
+    # it isn't in the normalizer's entity->ontology map and ARCHS4's free-text field
+    # mixes tissue/disease/cell-line/treatment — it needs NER + Cellosaurus, see TODO.)
+    fields:
+      tissue: tissues
+      disease: diseases
+
+# Train/valid/test split. Group by SERIES (GSE / SRA study) so no study leaks
+# across splits — the bulk analogue of the single-cell "split by dataset_id".
+split:
+  output_dir: transcriptomics/bulk/output/split   # train/valid/test live with the other bulk artifacts
+  group_by: series_id                              # whole studies (GSE) -> one split (leakage-safe)
+  train_frac: 0.90
+  valid_frac: 0.05
+  test_frac: 0.05

@@ -11,8 +11,8 @@ Each dataset is written to its own subdirectory under output_dir.
 Splitting into train/valid/test is NOT done here — it lives in split_dataset.py.
 
 Usage:
-    python transcriptomics/build_sc_dataset.py --config transcriptomics/pipeline_config.yaml
-    python transcriptomics/build_sc_dataset.py --config transcriptomics/pipeline_config.yaml --test
+    python transcriptomics/single_cell/build_sc_dataset.py --config transcriptomics/single_cell/pipeline_config.yaml
+    python transcriptomics/single_cell/build_sc_dataset.py --config transcriptomics/single_cell/pipeline_config.yaml --test
 """
 
 import argparse
@@ -50,7 +50,7 @@ def _setup_logging():
 _setup_logging()
 log = logging.getLogger(__name__)
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent.parent.parent  # repo root (transcriptomics/single_cell/ -> protgpt/)
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))  # make `protgpt` and `transcriptomics` importable
 

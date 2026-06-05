@@ -7,7 +7,7 @@ with UniProt bulk download as fallback for unmapped genes.
 Only keeps genes that map to proteins present in our proteomics model
 (i.e., the var_names of the proteomics training .h5ad).
 
-Output: transcriptomics/gene_protein_map.parquet
+Output: transcriptomics/single_cell/gene_protein_map.parquet
     Columns: ensembl_gene_id, uniprot_accession, gene_symbol, reviewed
 """
 
@@ -25,7 +25,7 @@ import requests
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent.parent.parent  # repo root (transcriptomics/single_cell/ -> protgpt/)
 
 
 def get_model_proteins(proteomics_path: str) -> set[str]:
@@ -218,7 +218,7 @@ def main():
     parser = argparse.ArgumentParser(description="Build Ensembl→UniProt gene-protein mapping")
     parser.add_argument("--proteomics", default=str(ROOT / "data/flashlfq_diann/train.h5ad"),
                         help="Proteomics training .h5ad (or legacy parquet) for the model protein list")
-    parser.add_argument("--output", default=str(ROOT / "transcriptomics/gene_protein_map.parquet"),
+    parser.add_argument("--output", default=str(ROOT / "transcriptomics/single_cell/gene_protein_map.parquet"),
                         help="Output path for the mapping table")
     args = parser.parse_args()
     build_mapping(args.proteomics, args.output)
