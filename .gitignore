@@ -60,6 +60,5 @@ _inspect_*.py
 _scratch*
 *.tmp
 
-
-experiments/*
+*.png
 config/*
