@@ -62,3 +62,5 @@ _scratch*
 
 *.png
 config/*
+
+*.svg

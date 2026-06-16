@@ -184,12 +184,15 @@ def _reduce(embeddings: np.ndarray, method: str = "umap", n_components: int = 2,
 
 def _scatter_2d(df: pd.DataFrame, x: str, y: str, color_by: str | None,
                 hover: list[str] | None, title: str, width: int, height: int,
-                save_path: str | None):
+                save_path: str | None,
+                color_order: list[str] | None = None,
+                palette: list[str] | None = None):
     """Interactive 2-D scatter via plotly express (shared by the visualize_* fns).
 
-    Categorical `color_by` gets a frequency-ordered legend and a large qualitative
-    palette (scales past 20 categories); numeric `color_by` uses a continuous scale.
-    Returns the plotly Figure.
+    Categorical `color_by` defaults to a frequency-ordered legend and a large
+    qualitative palette (scales past 20 categories); pass `color_order` to fix the
+    legend order and `palette` to supply your own colour sequence. Numeric
+    `color_by` uses a continuous scale. Returns the plotly Figure.
     """
     import plotly.express as px
 
@@ -199,12 +202,12 @@ def _scatter_2d(df: pd.DataFrame, x: str, y: str, color_by: str | None,
         kwargs["color"] = color_by
         is_categorical = not pd.api.types.is_numeric_dtype(df[color_by])
         if is_categorical:
-            order = df[color_by].astype(str).value_counts().index.tolist()
-            palette = px.colors.qualitative.Dark24 + px.colors.qualitative.Light24
+            order = color_order or df[color_by].astype(str).value_counts().index.tolist()
+            pal = palette or (px.colors.qualitative.Dark24 + px.colors.qualitative.Light24)
             df = df.copy()
             df[color_by] = df[color_by].astype(str)
-            kwargs["category_orders"] = {color_by: order}
-            kwargs["color_discrete_sequence"] = palette[:len(order)]
+            kwargs["category_orders"] = {color_by: [str(c) for c in order]}
+            kwargs["color_discrete_sequence"] = list(pal)[:len(order)]
 
     fig = px.scatter(df, **kwargs)
     fig.update_traces(marker=dict(size=4, opacity=0.7, line=dict(width=0)))
@@ -455,6 +458,8 @@ def visualize_sst(
     width: int = 1100,
     height: int = 700,
     save_path: str | None = None,
+    color_order: list[str] | None = None,
+    palette: list[str] | None = None,
     **reducer_kwargs,
 ):
     """Interactive (plotly) view of the Sample Summary Token (SST) embeddings from compute_sst().
@@ -463,6 +468,8 @@ def visualize_sst(
         sst: output dict from compute_sst() — must contain 'sst_emb' and 'sample_ids'.
         metadata: optional DataFrame keyed by 'sample_id' (column or index), e.g. ExpressionDataset.obs.
         color_by: metadata column to colour by (categorical → discrete palette, numeric → continuous).
+        color_order: explicit legend order for a categorical color_by (defaults to frequency order).
+        palette: explicit colour sequence aligned to color_order (defaults to Dark24+Light24).
         hover: extra metadata columns to show on hover (e.g. ['tissue', 'acquisition', 'split']).
         method: 'umap' | 'tsne' | 'pca' (defaults from _reduce).
         title / width / height: plot title and size.
@@ -486,7 +493,8 @@ def visualize_sst(
     hover_cols = ["sample_id"] + [c for c in (hover or []) if c in df.columns]
     color = color_by if (color_by and color_by in df.columns) else None
     return _scatter_2d(df, x, y, color, hover_cols,
-                       title or f"SST embeddings ({m})", width, height, save_path)
+                       title or f"SST embeddings ({m})", width, height, save_path,
+                       color_order=color_order, palette=palette)
 
 
 # ── attention-based protein–protein analysis (re-exported from protgpt.attention) ──

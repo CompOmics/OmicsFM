@@ -74,19 +74,26 @@ def _segmented_bins(vals: np.ndarray, lengths: np.ndarray, num_bins: int,
     n = len(vals)
     if n == 0:
         return np.zeros(0, dtype=np.uint8)
-    n_rows = len(lengths)
-    rows = np.repeat(np.arange(n_rows), lengths)          # sample id per element
-    starts = np.zeros(n_rows, dtype=np.int64)             # block-local row offsets
-    np.cumsum(lengths[:-1], out=starts[1:])
 
+    # Rank each sample's values within its OWN slice. A single global lexsort over the
+    # whole block's nonzeros (the previous approach) is memory-bandwidth bound and ~20x
+    # slower on dense (bulk) data, where each sample has ~15k nonzeros. Per-row sorts stay
+    # cache-resident. This is BYTE-IDENTICAL to the global version: the tie key is drawn in
+    # the same element order, and the global sort's within-sample ordering is exactly each
+    # sample sorted by (value, tie) — which is what we do here.
     tie = rng.random(n)                                   # random key → breaks ties unpredictably
-    order = np.lexsort((tie, vals, rows))                # by sample, then value, then random
-    within = np.arange(n) - starts[rows[order]]           # 0-based rank within its sample
-    ranks = np.empty(n, dtype=np.int64)
-    ranks[order] = within + 1                             # scatter back to original order
-
-    row_len = lengths[rows].astype(np.float64)
-    return np.ceil(ranks / row_len * num_bins).astype(np.uint8)
+    out = np.empty(n, dtype=np.uint8)
+    pos = 0
+    for L in lengths.tolist():
+        if L == 0:
+            continue
+        e = pos + L
+        order = np.lexsort((tie[pos:e], vals[pos:e]))     # within sample: by value, ties random
+        ranks = np.empty(L, dtype=np.int64)
+        ranks[order] = np.arange(1, L + 1)                # rank 1..L
+        out[pos:e] = np.ceil(ranks / L * num_bins).astype(np.uint8)
+        pos = e
+    return out
 
 
 def _split_row_groups(ids: np.ndarray, bins: np.ndarray, vals: np.ndarray,
@@ -115,6 +122,19 @@ def _split_row_groups(ids: np.ndarray, bins: np.ndarray, vals: np.ndarray,
 
 
 # ── per-block cache packing (shared by serial + parallel builds) ──────────────
+
+def _dense_block_to_components(block):
+    """Dense (rows x n_features) block -> the same (data, indices, lengths) a CSR row
+    slice yields: per-row nonzeros in column order. Lets the binner treat dense X
+    (bulk transcriptomics) identically to CSR X (proteomics / single-cell)."""
+    block = np.asarray(block)
+    mask = block > 0                                          # "detected" = nonzero, as in CSR
+    lengths = mask.sum(axis=1).astype(np.int64)
+    data = block[mask]                                       # row-major (matches CSR data order)
+    cols = np.broadcast_to(np.arange(block.shape[1], dtype=np.int64), block.shape)
+    idx = cols[mask]                                         # ascending col idx per row, like CSR
+    return np.ascontiguousarray(data), np.ascontiguousarray(idx), lengths
+
 
 def _pack_one_block(block_data, block_idx, lengths, num_bins, bin_seed, r0,
                     detect_groups, max_group_size, n_features) -> dict:
@@ -177,15 +197,18 @@ def _pack_block_worker(args: tuple) -> dict:
     in parallel — the main win for large caches.
     """
     (h5ad_path, r0, r1, num_bins, bin_seed, detect_groups,
-     max_group_size, n_features) = args
+     max_group_size, n_features, x_dense) = args
     import h5py
     with h5py.File(h5ad_path, "r") as f:
         Xg = f["X"]
-        indptr = Xg["indptr"][r0:r1 + 1]
-        s, e = int(indptr[0]), int(indptr[-1])
-        block_data = Xg["data"][s:e]
-        block_idx = Xg["indices"][s:e]
-    lengths = np.diff(indptr.astype(np.int64))
+        if x_dense:
+            block_data, block_idx, lengths = _dense_block_to_components(Xg[r0:r1])
+        else:
+            indptr = Xg["indptr"][r0:r1 + 1]
+            s, e = int(indptr[0]), int(indptr[-1])
+            block_data = Xg["data"][s:e]
+            block_idx = Xg["indices"][s:e]
+            lengths = np.diff(indptr.astype(np.int64))
     return _pack_one_block(block_data, block_idx, lengths, num_bins, bin_seed, r0,
                            detect_groups, max_group_size, n_features)
 
@@ -243,6 +266,14 @@ class ExpressionDataset(Dataset):
         self.modality = adata.uns.get("modality", "unknown")
         self._n_features = len(self.feature_names)
         self._n_samples = adata.n_obs
+        # X storage: CSR (proteomics / single-cell) or dense array (bulk) — both supported.
+        if self._adata is not None:
+            import scipy.sparse as _sp
+            self._x_dense = not _sp.issparse(self._adata.X)
+        else:
+            import h5py as _h5
+            with _h5.File(self.h5ad_path, "r") as _f:
+                self._x_dense = _f["X"].attrs.get("encoding-type") == "array"
         if self._adata is None and adata.isbacked:
             adata.file.close()
 
@@ -344,11 +375,30 @@ class ExpressionDataset(Dataset):
         return Xg["indptr"][:], Xg["data"], Xg["indices"], f
 
     def _block_ranges(self) -> list[tuple[int, int]]:
-        return [(r0, min(r0 + _BUILD_BLOCK, self._n_samples))
-                for r0 in range(0, self._n_samples, _BUILD_BLOCK)]
+        # Dense X (bulk) has ~50x more nonzeros/row than sparse, so use smaller blocks:
+        # keeps per-worker RAM + per-block sort cost bounded for parallel cache builds.
+        block = 2048 if getattr(self, "_x_dense", False) else _BUILD_BLOCK
+        return [(r0, min(r0 + block, self._n_samples))
+                for r0 in range(0, self._n_samples, block)]
 
     def _pack_blocks_serial(self, block_ranges) -> list[dict]:
-        """Build each block in-process, streaming the CSR from file or AnnData."""
+        """Build each block in-process, streaming X (CSR or dense) from file or AnnData."""
+        if self._x_dense:
+            import h5py
+            f = h5py.File(self.h5ad_path, "r") if self.h5ad_path is not None else None
+            Xsrc = f["X"] if f is not None else self._adata.X
+            try:
+                blocks = []
+                for r0, r1 in tqdm(block_ranges, desc="Building cache (dense)"):
+                    data, idx, lengths = _dense_block_to_components(np.asarray(Xsrc[r0:r1]))
+                    blocks.append(_pack_one_block(
+                        data, idx, lengths, self.num_bins, self.bin_seed, r0,
+                        self.detect_groups, self.max_group_size, self._n_features))
+                return blocks
+            finally:
+                if f is not None:
+                    f.close()
+
         indptr, data_acc, idx_acc, fh = self._csr_source()
         try:
             blocks = []
@@ -368,7 +418,7 @@ class ExpressionDataset(Dataset):
         """Build blocks across processes (file source). pool.map preserves order."""
         from concurrent.futures import ProcessPoolExecutor
         args = [(self.h5ad_path, r0, r1, self.num_bins, self.bin_seed,
-                 self.detect_groups, self.max_group_size, self._n_features)
+                 self.detect_groups, self.max_group_size, self._n_features, self._x_dense)
                 for r0, r1 in block_ranges]
         with ProcessPoolExecutor(max_workers=self.build_workers) as pool:
             return list(tqdm(pool.map(_pack_block_worker, args),
