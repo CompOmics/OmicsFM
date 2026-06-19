@@ -64,3 +64,9 @@ _scratch*
 config/*
 
 *.svg
+*.json
+*.csv
+*.txt
+
+_huri_data/
+_bioplex_data/
