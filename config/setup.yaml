@@ -3,18 +3,18 @@ data:
   # Unified .h5ad source for both modalities (build with protgpt.convert).
   # Proteomics:     data/<variant>/{train,valid,test}.h5ad
   # Transcriptomics: transcriptomics/split/{train,valid,test}.h5ad
-  train_path: data/flashlfq_diann/train.h5ad
-  valid_path: data/flashlfq_diann/valid.h5ad
-  test_path:  data/flashlfq_diann/test.h5ad
+  train_path: data/sc_trans/all_transcripts/train.h5ad
+  valid_path: data/sc_trans/all_transcripts/valid.h5ad
+  test_path:  data/sc_trans/all_transcripts/test.h5ad
 
   num_bins: 10                 # expression bins (1-10, 0 = not detected)
-  detect_groups: true          # collapse proteins with identical raw abundance into groups
+  detect_groups: false          # collapse proteins with identical raw abundance into groups
                                #   (proteomics only; set false for transcriptomics)
-  cache_build_workers: 1       # processes for the one-time bin-cache build (1 = serial).
+  cache_build_workers: 1      # processes for the one-time bin-cache build (dense bulk needs parallel).
 
 # Transfer learning (optional)
 transfer:
-  checkpoint_path:  null         # path to pretrained checkpoint (.ckpt), null = train from scratch
+  checkpoint_path: null         # path to pretrained checkpoint (.ckpt), null = train from scratch
   freeze_transformer: false      # freeze transformer layers initially
   freeze_epochs: 0               # unfreeze after N epochs (0 = never freeze)
 
@@ -29,7 +29,7 @@ model:
   input_features: 1024         # max detected individual features per sample (subsample if more, pad if fewer)
   feature_context_ratio: 0.85  # fraction of individual features used as context
   
-  use_esmc: true             # MUST be false for gene accessions (ESM-C only embeds protein/UniProt ids)
+  use_esmc: false             # MUST be false for gene accessions (ESM-C only embeds protein/UniProt ids)
   fasta_path: fasta/human_proteome_canonical_31032022.fasta  # protein sequences for ESM-C
   esmc_model: esmc_600m        # ESM-C model variant (esmc_300m or esmc_600m)
   esmc_cache: data/esmc_human_cache.pt   # optional: pre-computed ESM-C embeddings (skips inference if present)
@@ -63,5 +63,5 @@ training:
   num_workers: 0
 
 output:
-  save_dir: model                               # directory for checkpoints and logs
-  experiment_name: prot_esmc     # subdirectory for this run
+  save_dir: model                # directory for checkpoints and logs
+  experiment_name: sc_trans_all_transcripts     # subdirectory for this run
