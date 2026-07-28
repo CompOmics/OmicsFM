@@ -33,4 +33,7 @@ dependencies:
   - pip:
       - --extra-index-url https://download.pytorch.org/whl/cu128
       - torch==2.10.0+cu128
+      # OmicsFM never imports torchvision, but esm and transformers declare it,
+      # and an unpinned resolve pulls a build compiled against a different torch.
+      - torchvision==0.25.0+cu128
       - --editable ..[all]
