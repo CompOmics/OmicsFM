@@ -14,6 +14,8 @@ transcriptomics/*/*.parquet
 *.ckpt
 *.pt
 *.pth
+*.bin
+*.safetensors
 *.h5
 *.h5ad
 *.hdf5
@@ -70,3 +72,44 @@ config/*
 
 _huri_data/
 _bioplex_data/
+
+# Downloaded foundation-model checkpoints
+gf-12L-30M-i2048/
+
+# ── exp3.1 vendored upstream snapshots ──────────────────────────────────
+# Keep the importable packages, the licenses, and the files the README cites as
+# implementation sources. Drop the upstream notebook/test/tutorial corpora,
+# which are ~500 MB of embedded notebook output unrelated to this benchmark.
+experiments/exp3.1/upstream_scPRINT/notebooks/*
+!experiments/exp3.1/upstream_scPRINT/notebooks/bench_omni.ipynb
+experiments/exp3.1/upstream_scPRINT/tests/
+experiments/exp3.1/upstream_scPRINT/docs/
+experiments/exp3.1/upstream_scPRINT/figures/*
+experiments/exp3.1/scgpt_reproduction/upstream_jkobject_scGPT/docs/
+experiments/exp3.1/scgpt_reproduction/upstream_jkobject_scGPT/tutorials/
+experiments/exp3.1/scgpt_reproduction/upstream_jkobject_scGPT/tests/
+experiments/exp3.1/scgpt_reproduction/upstream_jkobject_scGPT/mytests/*
+!experiments/exp3.1/scgpt_reproduction/upstream_jkobject_scGPT/mytests/scgpt_helper.py
+!experiments/exp3.1/scgpt_reproduction/upstream_jkobject_scGPT/mytests/trials/
+experiments/exp3.1/scgpt_reproduction/upstream_jkobject_scGPT/mytests/trials/*
+!experiments/exp3.1/scgpt_reproduction/upstream_jkobject_scGPT/mytests/trials/benchmark_grn_omni.ipynb
+
+# Benchmark inputs excluded by the blanket data rules above. Parent directories
+# must be re-included before the files themselves. The neighbouring upstream
+# artifacts (stringdb_bias.parquet et al.) stay excluded.
+!experiments/exp3.1/upstream_scPRINT/data/
+!experiments/exp3.1/upstream_scPRINT/data/main/
+!experiments/exp3.1/upstream_scPRINT/data/main/omnipath.parquet
+!experiments/exp3.1/upstream_scPRINT/figures/data/
+!experiments/exp3.1/upstream_scPRINT/figures/data/omni.tsv
+
+# Published exp3.1 outputs: the tables behind the paper and the final figure.
+!experiments/exp3.1/results/benchmark_metrics.csv
+!experiments/exp3.1/results/benchmark_aggregate.csv
+!experiments/exp3.1/results/scprint_reproduction_summary.csv
+!experiments/exp3.1/results/paper_comparison.csv
+!experiments/exp3.1/figures/exp3_1_scprint_benchmark.svg
+
+# ── cache ─────────────────────────────────────────────────────
+.numba_cache/
+_numba_cache/
