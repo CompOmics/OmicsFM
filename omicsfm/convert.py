@@ -15,9 +15,9 @@ full (up to ~60 GB) index array in RAM, and writes CSR with int32 indices + int6
 indptr directly (scipy would upcast both to int64 for billions of non-zeros).
 
 Usage:
-    python -m protgpt.convert --input data/nsaf_diann/quant_train.parquet \
+    python -m omicsfm.convert --input data/nsaf_diann/quant_train.parquet \
                               --output data/nsaf_diann/train.h5ad
-    python -m protgpt.convert --input transcriptomics/split/test.npz \
+    python -m omicsfm.convert --input transcriptomics/split/test.npz \
                               --output transcriptomics/split/test.h5ad \
                               --protein-columns transcriptomics/output/protein_columns.json
 """

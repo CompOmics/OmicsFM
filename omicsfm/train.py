@@ -1,6 +1,6 @@
 """
 Training loop for ProtGPT.
-Usage: python -m protgpt.train --config config/setup.yaml
+Usage: python -m omicsfm.train --config config/setup.yaml
 """
 
 PROJECT_NAME = 'protGPT'
@@ -18,8 +18,8 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader
 from pathlib import Path
 
-from protgpt.data import ExpressionDataset, ExpressionCollator
-from protgpt.architecture import ProtGPT
+from omicsfm.data import ExpressionDataset, ExpressionCollator
+from omicsfm.architecture import ProtGPT
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger(__name__)
@@ -125,7 +125,7 @@ def train(config_path: str):
     # build ESM-C lookup table from FASTA if enabled
     esmc_lookup = None
     if model_cfg["use_esmc"]:
-        from protgpt.esmc_utils import build_esmc_lookup
+        from omicsfm.esmc_utils import build_esmc_lookup
         esmc_lookup = build_esmc_lookup(
             feature_names,
             mcfg["fasta_path"],

@@ -52,7 +52,7 @@ log = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parent.parent.parent  # repo root (transcriptomics/single_cell/ -> protgpt/)
 if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))  # make `protgpt` and `transcriptomics` importable
+    sys.path.insert(0, str(ROOT))  # make `omicsfm` and `transcriptomics` importable
 
 DTYPE_MAP = {
     "uint8": np.uint8,
@@ -410,7 +410,7 @@ def save_dataset(output_dir: Path, X: csr_matrix, metadata: pd.DataFrame,
     accessions (var) in one file — the format consumed by split_dataset.py and
     protgpt.data.ExpressionDataset.
     """
-    from protgpt.convert import save_unified_h5ad
+    from omicsfm.convert import save_unified_h5ad
 
     output_dir.mkdir(parents=True, exist_ok=True)
     t0 = time.time()

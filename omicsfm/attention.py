@@ -32,16 +32,23 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from protgpt.architecture import TransformerBlock
-from protgpt.api import _load_checkpoint, build_model_for_dataset
-from protgpt.data import ExpressionDataset, ExpressionCollator
+from omicsfm.architecture import TransformerBlock
+from omicsfm.data import ExpressionDataset, ExpressionCollator
+# omicsfm.api is imported inside _build rather than here: api re-exports this
+# module's public functions at its own bottom, so a module-level import either
+# way round makes `import omicsfm.attention` fail on its own.
 
 log = logging.getLogger(__name__)
 
-# Ground-truth PPI databases ship inside the package (resolved relative to this
-# file so it works from any working directory). For deployment these can instead
-# be fetched from Zenodo into this directory.
-GT_DIR_DEFAULT = str(Path(__file__).resolve().parent / "ppi_ground_truth")
+# Ground-truth PPI matrices are data, not package contents, so they live under
+# data/ppi_ground_truth/ at the repository root rather than beside this file.
+# The default below resolves that location for an editable install; set
+# OMICSFM_GT_DIR, or pass gt_dir explicitly, when the package is installed
+# normally or the matrices are fetched from Zenodo elsewhere.
+GT_DIR_DEFAULT = os.environ.get(
+    "OMICSFM_GT_DIR",
+    str(Path(__file__).resolve().parents[1] / "data" / "ppi_ground_truth"),
+)
 DATABASES = ("corum", "gocc", "kegg", "reactome", "string")
 
 
@@ -130,6 +137,8 @@ def _capture_attention(model, spec):
 def _build(checkpoint_path, data_path, device, batch_size, num_workers,
            fasta_path, esmc_cache, shuffle):
     """Load checkpoint config + dataset + model + an all-context dataloader."""
+    from omicsfm.api import _load_checkpoint, build_model_for_dataset
+
     ckpt = _load_checkpoint(checkpoint_path)
     cfg, mcfg, dcfg = ckpt["config"], ckpt["config"]["model"], ckpt["config"]["data"]
     detect_groups = dcfg.get("detect_groups", dcfg.get("has_protein_groups", False))
@@ -196,7 +205,8 @@ def _finalize(summ, cnt, symmetrize):
 
 def attention_map(checkpoint_path, data_path, head=None, proteins=None,
                   n_epochs=1, batch_size=32, num_workers=0, device="cuda",
-                  fasta_path=None, esmc_cache=None, symmetrize=True, accum_device=None):
+                  fasta_path=None, esmc_cache=None, symmetrize=True, accum_device=None,
+                  progress=True):
     """Accumulate one protein×protein attention map over a dataset.
 
     Args:
@@ -212,6 +222,7 @@ def attention_map(checkpoint_path, data_path, head=None, proteins=None,
             count is direction-independent, so all asymmetry comes from attention
             itself. The diagonal is NaN either way.
         accum_device: where the (P,P) accumulators live (default = device).
+        progress: show a tqdm progress bar for each pass (default = True).
 
     Returns:
         dict: {'attn': (P', P') float32, 'count': (P', P'), 'proteins': [accessions]}.
@@ -233,7 +244,8 @@ def attention_map(checkpoint_path, data_path, head=None, proteins=None,
 
     with _capture_attention(model, spec) as buf, torch.no_grad():
         for ep in range(n_epochs):
-            for batch in tqdm(dl, desc=f"attention {ep + 1}/{n_epochs}"):
+            for batch in tqdm(dl, desc=f"attention {ep + 1}/{n_epochs}",
+                              disable=not progress):
                 batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
                 buf.clear()
                 model(batch)

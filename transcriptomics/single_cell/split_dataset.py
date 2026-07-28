@@ -31,7 +31,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parent.parent.parent  # repo root (transcriptomics/single_cell/ -> protgpt/)
 if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))  # make `protgpt` importable when run as a script
+    sys.path.insert(0, str(ROOT))  # make `omicsfm` importable when run as a script
 
 logging.basicConfig(
     level=logging.INFO,
@@ -80,7 +80,7 @@ def split_expression(expression: str, output_dir: Path,
     train takes whatever fraction is left after valid_frac + test_frac.
     """
     import anndata as ad
-    from protgpt.convert import save_unified_h5ad
+    from omicsfm.convert import save_unified_h5ad
 
     log.info(f"Loading {expression}...")
     t0 = time.time()

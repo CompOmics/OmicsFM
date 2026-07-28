@@ -126,7 +126,7 @@ def build_esmc_lookup(
                 f"{len(missing_from_cache)}/{len(protein_names)} proteins missing from "
                 f"ESM-C cache ({cache_path}). First 10: {preview}{more}. "
                 f"Delete the cache to recompute, or pre-build it with "
-                f"`python -m protgpt.esmc_utils --fasta {fasta_path} --save {cache_path}`."
+                f"`python -m omicsfm.esmc_utils --fasta {fasta_path} --save {cache_path}`."
             )
         lookup = _build_lookup_tensor(protein_names, cached_embs)
         log.info(f"Built ESM-C lookup from cache: {lookup.shape}")

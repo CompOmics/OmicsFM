@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omicsfm"
+version = "0.1.0"
+description = "OmicsFM: a foundation model over paired proteomic and transcriptomic expression"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Sander Heyndrickx" }]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+
+# Core runtime: loading a checkpoint and running inference or attention
+# extraction. Versions are left open here; the pinned, reproducible
+# environments live in envs/.
+dependencies = [
+    "anndata",
+    "h5py",
+    "numpy",
+    "pandas",
+    "scikit-learn",
+    "scipy",
+    "torch",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+# omicsfm.train
+train = ["psutil", "pyyaml", "wandb"]
+# omicsfm.esmc_utils - ESM-C protein sequence embeddings
+esmc = ["esm"]
+# interactive plots in omicsfm.api / omicsfm.attention
+viz = ["plotly", "umap-learn"]
+all = ["omicsfm[train,esmc,viz]"]
+
+[tool.setuptools]
+# Source-only package. Ground-truth matrices and checkpoints are data, not
+# package contents; they live under data/ and model/ at the repository root.
+packages = ["omicsfm"]
+
+[tool.setuptools.package-data]
+omicsfm = []

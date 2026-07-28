@@ -23,8 +23,8 @@ from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 from tqdm import tqdm
 
-from protgpt.architecture import ProtGPT
-from protgpt.data import ExpressionCollator, ExpressionDataset
+from omicsfm.architecture import ProtGPT
+from omicsfm.data import ExpressionCollator, ExpressionDataset
 
 log = logging.getLogger(__name__)
 
@@ -122,7 +122,7 @@ def build_model_for_dataset(
 
     esmc_lookup = None
     if use_esmc:
-        from protgpt.esmc_utils import build_esmc_lookup
+        from omicsfm.esmc_utils import build_esmc_lookup
         fasta = fasta_path or cfg["model"]["fasta_path"]
         cache = esmc_cache or cfg["model"].get("esmc_cache")
         esmc_lookup = build_esmc_lookup(
@@ -497,10 +497,10 @@ def visualize_sst(
                        color_order=color_order, palette=palette)
 
 
-# ── attention-based protein–protein analysis (re-exported from protgpt.attention) ──
-# Imported at the bottom because protgpt.attention imports _load_checkpoint /
-# build_model_for_dataset from this module (avoids a circular import at top).
-from protgpt.attention import (  # noqa: E402
+# ── attention-based protein–protein analysis (re-exported from omicsfm.attention) ──
+# Imported at the bottom so these stay available as omicsfm.api.<name>;
+# omicsfm.attention defers its import of this module to avoid the cycle.
+from omicsfm.attention import (  # noqa: E402
     attention_map,
     eval_attention_heads,
     enrichment_curves,
