@@ -16,15 +16,19 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Bio-Informatics",
 ]
 
-# Core runtime: loading a checkpoint and running inference or attention
-# extraction. Versions are left open here; the pinned, reproducible
-# environments live in envs/.
+# Core runtime: loading a checkpoint, running inference, extracting attention
+# and fetching artifacts. Everything imported at module level by api, attention,
+# data or convert belongs here, so `import omicsfm.api` works on a bare install.
+# Versions are deliberately open; environment.lock.yml records what was run.
 dependencies = [
     "anndata",
     "h5py",
+    "huggingface_hub",   # omicsfm.hub, artifact download
     "numpy",
     "pandas",
-    "scikit-learn",
+    "psutil",            # omicsfm.data, memory accounting
+    "pyyaml",            # module-level in omicsfm.api
+    "scikit-learn",      # module-level in omicsfm.api
     "scipy",
     "torch",
     "tqdm",
@@ -32,12 +36,14 @@ dependencies = [
 
 [project.optional-dependencies]
 # omicsfm.train
-train = ["psutil", "pyyaml", "wandb"]
+train = ["wandb"]
 # omicsfm.esmc_utils - ESM-C protein sequence embeddings
-esmc = ["esm"]
-# interactive plots in omicsfm.api / omicsfm.attention
+esmc = ["esm", "biopython"]
+# interactive plots in omicsfm.api / omicsfm.attention (imported lazily)
 viz = ["plotly", "umap-learn"]
-all = ["omicsfm[train,esmc,viz]"]
+# running setup.ipynb and the figure notebooks
+notebook = ["ipykernel", "ipywidgets", "matplotlib"]
+all = ["omicsfm[train,esmc,viz,notebook]"]
 
 [tool.setuptools]
 # Source-only package. Ground-truth matrices and checkpoints are data, not
