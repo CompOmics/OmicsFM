@@ -73,23 +73,23 @@ CHECKPOINTS = {
     "sc_transcriptomics_esmc":   111.4,
 }
 
-# Hub dataset name -> (repo key, local directory, {split: MB}).
+# Hub dataset name -> (repo key, {split: MB}).
+#
+# Like the checkpoints, downloads land in data/<name>/, mirroring the Hub, so
+# the identifier authority is visible in the path: data/sc_transcriptomics_uniprot/
+# rather than data/sc_trans/protein_mapped/. Datasets built before this
+# convention still sit under their original directories.
 DATASETS = {
     "proteomics_uniprot": (
-        "proteomics", "data/flashlfq_diann",
-        {"train": 651.7, "valid": 20.1, "test": 34.1}),
+        "proteomics", {"train": 651.7, "valid": 20.1, "test": 34.1}),
     "bulk_transcriptomics_uniprot": (
-        "data", "data/bulk_trans/protein_mapped",
-        {"train": 20305.0, "valid": 1105.9, "test": 1054.7}),
+        "data", {"train": 20305.0, "valid": 1105.9, "test": 1054.7}),
     "bulk_transcriptomics_hgnc": (
-        "data", "data/bulk_trans/all_transcripts",
-        {"train": 38676.5, "valid": 2119.7, "test": 2017.3}),
+        "data", {"train": 38676.5, "valid": 2119.7, "test": 2017.3}),
     "sc_transcriptomics_uniprot": (
-        "data", "data/sc_trans/protein_mapped",
-        {"train": 11386.9, "valid": 1269.8, "test": 2927.2}),
+        "data", {"train": 11386.9, "valid": 1269.8, "test": 2927.2}),
     "sc_transcriptomics_ensembl": (
-        "data", "data/sc_trans/all_transcripts",
-        {"train": 11284.5, "valid": 1239.0, "test": 3127.7}),
+        "data", {"train": 11284.5, "valid": 1239.0, "test": 3127.7}),
 }
 
 ARTIFACTS: dict[str, Artifact] = {}
@@ -121,13 +121,13 @@ ARTIFACTS["esmc_cache"] = Artifact(
     description="Precomputed ESM-C sequence embeddings",
 )
 
-for _name, (_repo, _dir, _splits) in DATASETS.items():
+for _name, (_repo, _splits) in DATASETS.items():
     for _split, _mb in _splits.items():
         ARTIFACTS[f"{_name}/{_split}"] = Artifact(
             key=f"{_name}/{_split}", repo=_repo,
             remote=f"{_name}/{_split}.h5ad",
-            local=f"{_dir}/{_split}.h5ad",
-            megabytes=_mb, tier=_split if _split != "test" else "test",
+            local=f"data/{_name}/{_split}.h5ad",
+            megabytes=_mb, tier=_split,
             description=f"{_name} {_split} split",
         )
 
