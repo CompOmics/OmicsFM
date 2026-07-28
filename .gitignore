@@ -130,3 +130,6 @@ _numba_cache/
 
 # downloaded source databases for the ground-truth builders
 reference/notebooks/_downloads/
+
+# one-off maintenance scripts, kept locally only
+tools/
