@@ -57,18 +57,20 @@ class Artifact:
     description: str
 
 
-# Published name -> (directory under model/, size in MB).
+# Checkpoint name -> size in MB. Names describe what a user chooses between:
+# the input modality, and whether ESM-C sequence embeddings are used.
 #
-# The Hub names describe what a user chooses between: the input modality, and
-# whether ESM-C sequence embeddings are used. The local directories keep their
-# original training-run names so existing experiment code is unaffected.
+# Downloads land in model/<name>/, matching the Hub exactly, so there is one
+# name for each model rather than a published name and a training-run name.
+# Checkpoints trained before this convention still sit in directories named
+# after their training run; set OMICSFM_HOME or move them to use both.
 CHECKPOINTS = {
-    "proteomics":                ("prot_flashlfq_diann",       39.0),
-    "proteomics_esmc":           ("prot_flashlfq_diann_esmc",  111.4),
-    "bulk_transcriptomics":      ("bulk_trans",                39.0),
-    "bulk_transcriptomics_esmc": ("bulk_trans_esmc",           111.4),
-    "sc_transcriptomics":        ("trans_prot_mapped",         39.0),
-    "sc_transcriptomics_esmc":   ("trans_prot_mapped_esmc",    111.4),
+    "proteomics":                39.0,
+    "proteomics_esmc":           111.4,
+    "bulk_transcriptomics":      39.0,
+    "bulk_transcriptomics_esmc": 111.4,
+    "sc_transcriptomics":        39.0,
+    "sc_transcriptomics_esmc":   111.4,
 }
 
 # Hub dataset name -> (repo key, local directory, {split: MB}).
@@ -92,13 +94,22 @@ DATASETS = {
 
 ARTIFACTS: dict[str, Artifact] = {}
 
-for _name, (_dir, _mb) in CHECKPOINTS.items():
+for _name, _mb in CHECKPOINTS.items():
     ARTIFACTS[_name] = Artifact(
         key=_name, repo="model",
         remote=f"{_name}/best_model.ckpt",
-        local=f"model/{_dir}/best_model.ckpt",
+        local=f"model/{_name}/best_model.ckpt",
         megabytes=_mb, tier="models",
         description=f"OmicsFM checkpoint: {_name}",
+    )
+    # The training configuration travels with the weights: architecture,
+    # hyperparameters, epoch and validation loss, readable without torch.
+    ARTIFACTS[f"{_name}/config"] = Artifact(
+        key=f"{_name}/config", repo="model",
+        remote=f"{_name}/config.yaml",
+        local=f"model/{_name}/config.yaml",
+        megabytes=0.002, tier="models",
+        description=f"Training configuration: {_name}",
     )
 
 # Needed by the ESM-C checkpoints. The FASTA it derives from is tracked in git.
