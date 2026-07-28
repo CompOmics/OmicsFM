@@ -28,12 +28,19 @@ CACHE = Path(__file__).resolve().parent / "_downloads"
 CACHE.mkdir(parents=True, exist_ok=True)
 
 
-def fetch(url: str, name: str | None = None, *, timeout: int = 300) -> Path:
+def fetch(url: str, name: str | None = None, *, timeout: int = 300,
+          attempts: int = 5) -> Path:
     """Download `url` into the cache once and return the local path.
 
     Re-running a notebook reuses the cached copy rather than hitting the
     source database again. Delete the file to force a refresh.
+
+    Downloads stream to a .part file and are renamed on completion, so an
+    interrupted transfer never leaves a truncated file that looks cached.
+    Several of these sources drop long connections, hence the retries.
     """
+    import time
+
     import requests
 
     target = CACHE / (name or url.rsplit("/", 1)[-1].split("?")[0])
@@ -41,14 +48,31 @@ def fetch(url: str, name: str | None = None, *, timeout: int = 300) -> Path:
         print(f"cached: {target.name} ({target.stat().st_size / 1e6:.1f} MB)")
         return target
 
-    print(f"downloading {url}")
-    response = requests.get(url, timeout=timeout, stream=True)
-    response.raise_for_status()
     tmp = target.with_suffix(target.suffix + ".part")
-    with tmp.open("wb") as handle:
-        for chunk in response.iter_content(chunk_size=1 << 20):
-            handle.write(chunk)
-    tmp.replace(target)
+    print(f"downloading {url}")
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            with requests.get(url, stream=True, timeout=(30, timeout)) as response:
+                response.raise_for_status()
+                with tmp.open("wb") as handle:
+                    for chunk in response.iter_content(chunk_size=1 << 20):
+                        if chunk:
+                            handle.write(chunk)
+            tmp.replace(target)
+            last_error = None
+            break
+        except (requests.exceptions.ChunkedEncodingError,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.ReadTimeout) as error:
+            last_error = error
+            print(f"  attempt {attempt}/{attempts} failed: {error!r}")
+            tmp.unlink(missing_ok=True)
+            if attempt < attempts:
+                time.sleep(2 ** attempt)
+    if last_error is not None:
+        raise last_error
+
     print(f"cached: {target.name} ({target.stat().st_size / 1e6:.1f} MB)")
     return target
 
