@@ -43,7 +43,26 @@ esmc = ["esm", "biopython"]
 viz = ["plotly", "umap-learn"]
 # running setup.ipynb and the figure notebooks
 notebook = ["ipykernel", "ipywidgets", "matplotlib"]
-all = ["omicsfm[train,esmc,viz,notebook]"]
+# reference/notebooks/ - rebuilding the PPI ground-truth matrices from source
+reference = ["mygene", "omnipath", "requests"]
+# transcriptomics/ - building the expression datasets from primary sources.
+# Heavy (tiledbsoma, cellxgene-census), so deliberately not part of a default
+# install; only needed to regenerate the datasets rather than to use them.
+datasets = [
+    "archs4py",
+    "cellxgene-census",
+    "mygene",
+    "pyarrow",          # pandas parquet I/O
+    "requests",
+    "tiledbsoma",
+]
+all = ["omicsfm[train,esmc,viz,notebook,reference]"]
+# Everything including the dataset-construction stack.
+full = ["omicsfm[all,datasets]"]
+
+# transcriptomics/bulk/normalize_metadata.py optionally uses agentic_metadata,
+# a separate project imported lazily inside the functions that need it. It is
+# not declared here because it is not published and not required to run OmicsFM.
 
 [tool.setuptools]
 # Source-only package. Ground-truth matrices and checkpoints are data, not
