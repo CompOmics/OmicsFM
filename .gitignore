@@ -127,3 +127,6 @@ experiments/exp3.1/scgpt_reproduction/upstream_jkobject_scGPT/mytests/trials/*
 # ── cache ─────────────────────────────────────────────────────
 .numba_cache/
 _numba_cache/
+
+# downloaded source databases for the ground-truth builders
+reference/notebooks/_downloads/
