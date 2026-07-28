@@ -44,8 +44,10 @@ train = ["wandb"]
 esmc = ["esm", "biopython"]
 # interactive plots in omicsfm.api / omicsfm.attention (imported lazily)
 viz = ["plotly", "umap-learn"]
-# running setup.ipynb and the figure notebooks
-notebook = ["ipykernel", "ipywidgets", "matplotlib"]
+# running the notebooks. nbformat is required by plotly's fig.show(): without
+# it, visualize_sst raises "Mime type rendering requires nbformat" only at the
+# point of display, after the embedding work is already done.
+notebook = ["ipykernel", "ipywidgets", "matplotlib", "nbformat"]
 # reference/notebooks/ - rebuilding the PPI ground-truth matrices from source
 reference = ["mygene", "omnipath", "requests"]
 # transcriptomics/ - building the expression datasets from primary sources.
