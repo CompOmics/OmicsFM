@@ -34,6 +34,9 @@ dependencies = [
     "tqdm",
 ]
 
+[project.scripts]
+omicsfm = "omicsfm._cli:main"
+
 [project.optional-dependencies]
 # omicsfm.train
 train = ["wandb"]
