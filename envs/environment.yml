@@ -16,9 +16,14 @@
 # Versions float. For the exact stack a published result was produced with, see
 # envs/environment.lock.yml.
 #
-# CUDA: torch is taken from the cu128 wheel index below, matching the hardware
-# the models were trained on. Change the URL for a different CUDA version, or
-# use https://download.pytorch.org/whl/cpu for a CPU-only install.
+# CUDA: torch is pinned to a +cu128 build, matching the hardware the models were
+# trained on. The pin is required, not cosmetic: --extra-index-url only adds the
+# CUDA index alongside PyPI, and pip then picks whichever version is highest,
+# which is the CPU-only wheel. Naming the +cu128 local version forces the CUDA
+# build, since PyPI carries no such variant.
+#
+# For a different CUDA version change both the URL and the pin; for CPU-only,
+# drop the torch line and the index URL entirely.
 name: omicsfm
 channels:
   - conda-forge
@@ -27,4 +32,5 @@ dependencies:
   - pip
   - pip:
       - --extra-index-url https://download.pytorch.org/whl/cu128
+      - torch==2.10.0+cu128
       - --editable ..[all]
