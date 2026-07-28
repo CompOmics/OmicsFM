@@ -4,9 +4,8 @@ Import it from any of them:
 
     from _common import CACHE, FASTA, fetch, require_manual
 
-Everything resolves relative to the installed omicsfm package, so the
-notebooks work on any machine and from any working directory. Downloads are
-cached under reference/notebooks/_downloads/ and reused on later runs.
+Everything resolves relative to the installed omicsfm package. 
+Downloads are cached under reference/notebooks/_downloads/ and reused on later runs.
 """
 
 from __future__ import annotations
