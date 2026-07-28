@@ -4,8 +4,9 @@
 #     conda env create -f envs/environment.yml
 #     conda activate omicsfm
 #
-# Run it from the repository root: the editable install below resolves "."
-# against the working directory, not against this file.
+# The editable path below is ".." because conda resolves relative paths in the
+# pip section against this file's directory, not the working directory. From
+# envs/, ".." is the repository root, where pyproject.toml lives.
 #
 # Works unchanged on Windows and Linux: conda supplies only Python and pip, and
 # pip resolves platform-appropriate wheels. Dependencies come from
@@ -26,4 +27,4 @@ dependencies:
   - pip
   - pip:
       - --extra-index-url https://download.pytorch.org/whl/cu128
-      - --editable .[all]
+      - --editable ..[all]
