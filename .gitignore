@@ -76,6 +76,14 @@ _bioplex_data/
 # Downloaded foundation-model checkpoints
 gf-12L-30M-i2048/
 
+# ── reference data (tracked) ────────────────────────────────────────────
+# Small, version-pinned reference material kept in git, as distinct from the
+# bulk datasets under data/. The blanket *.npz and *.tsv rules above would
+# otherwise hide it. Published results are pinned to these exact matrices.
+!reference/
+!reference/*.npz
+!reference/*.tsv
+
 # ── exp3.1 vendored upstream snapshots ──────────────────────────────────
 # Keep the importable packages, the licenses, and the files the README cites as
 # implementation sources. Drop the upstream notebook/test/tutorial corpora,

@@ -40,27 +40,108 @@ from omicsfm.data import ExpressionDataset, ExpressionCollator
 
 log = logging.getLogger(__name__)
 
-# Ground-truth PPI matrices are data, not package contents, so they live under
-# data/ppi_ground_truth/ at the repository root rather than beside this file.
+# Ground-truth PPI matrices live in reference/ at the repository root: small,
+# version-pinned reference data kept in git, as distinct from the bulk datasets
+# under data/. The notebooks that build them sit in reference/notebooks/.
 # The default below resolves that location for an editable install; set
 # OMICSFM_GT_DIR, or pass gt_dir explicitly, when the package is installed
-# normally or the matrices are fetched from Zenodo elsewhere.
+# normally or the matrices are staged elsewhere.
 GT_DIR_DEFAULT = os.environ.get(
     "OMICSFM_GT_DIR",
-    str(Path(__file__).resolve().parents[1] / "data" / "ppi_ground_truth"),
+    str(Path(__file__).resolve().parents[1] / "reference"),
 )
 DATABASES = ("corum", "gocc", "kegg", "reactome", "string")
 
 
 # ── ground truth ────────────────────────────────────────────────────────────
 
+def _dense_from_sparse(npz) -> np.ndarray:
+    """Rebuild the dense ternary matrix from the compact representation.
+
+    The matrices hold only 0, 1 and NaN, and the NaN pattern is entirely
+    determined by which proteins the database covers plus the excluded
+    self-pairs, so only the positives and the universe are stored. This
+    reconstructs the original array exactly, including dtype and NaN placement.
+    """
+    out = np.full(tuple(npz["shape"]), np.nan, dtype=np.float32)
+    universe = npz["universe"].astype(np.int64)
+    out[np.ix_(universe, universe)] = 0.0     # covered pairs are evaluable
+    out[universe, universe] = np.nan          # except a protein with itself
+    out[npz["rows"].astype(np.int64), npz["cols"].astype(np.int64)] = 1.0
+    return out
+
+
+def _sparse_from_dense(matrix: np.ndarray) -> dict:
+    """Reduce a dense ternary matrix to the parts that are not implied.
+
+    Raises rather than losing information: the encoding is only valid when the
+    matrix holds exactly 0/1/NaN and its NaN pattern is 'outside the covered
+    universe, plus the diagonal'.
+    """
+    if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
+        raise ValueError(f"expected a square matrix, got {matrix.shape}")
+    if max(matrix.shape) > np.iinfo(np.uint16).max:
+        raise ValueError(f"vocabulary of {max(matrix.shape)} exceeds uint16")
+
+    extra = set(np.unique(matrix[~np.isnan(matrix)]).tolist()) - {0.0, 1.0}
+    if extra:
+        raise ValueError(f"expected only 0/1/NaN, also found {sorted(extra)}")
+
+    nan = np.isnan(matrix)
+    universe = np.flatnonzero(~nan.all(axis=1))
+    block = nan[np.ix_(universe, universe)]
+    if int(block.sum()) != universe.size or not bool(np.diag(block).all()):
+        raise ValueError("NaN pattern is not 'outside universe, plus diagonal'; "
+                         "this encoding would be lossy")
+
+    rows, cols = np.nonzero(matrix == 1)
+    return {
+        "universe": universe.astype(np.uint16),
+        "rows": rows.astype(np.uint16),
+        "cols": cols.astype(np.uint16),
+        "shape": np.asarray(matrix.shape, dtype=np.int64),
+        "format_version": np.asarray(1, dtype=np.int64),
+    }
+
+
+def save_ppi_ground_truth(path, matrix: np.ndarray, *, overwrite: bool = False):
+    """Write a ground-truth matrix in the compact format.
+
+    Refuses to replace an existing file unless ``overwrite=True``. Published
+    results are pinned to specific matrices, and the source databases change
+    continuously, so re-running a builder must never silently rewrite them.
+
+    Verifies the round-trip before writing, so a matrix that cannot be encoded
+    losslessly raises instead of being written.
+    """
+    path = Path(path)
+    if path.exists() and not overwrite:
+        raise FileExistsError(
+            f"{path} already exists. Published results are pinned to the current "
+            "matrices; write elsewhere, or pass overwrite=True deliberately."
+        )
+
+    parts = _sparse_from_dense(np.asarray(matrix, dtype=np.float32))
+    restored = _dense_from_sparse(parts)
+    reference = np.asarray(matrix, dtype=np.float32)
+    if not np.array_equal(reference, restored, equal_nan=True):
+        raise ValueError("round-trip check failed; refusing to write")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(path, **parts)
+    return path
+
+
 def load_ppi_ground_truth(db: str, gt_dir: str = GT_DIR_DEFAULT):
     """Load a PPI ground-truth matrix + its protein order.
+
+    Reads either the compact format (keys 'universe'/'rows'/'cols'/'shape') or
+    the original dense one (key 'matrix'); both yield an identical array.
 
     Args:
         db: one of the matrices in gt_dir, e.g. 'corum', 'string', 'kegg',
             'reactome', 'gocc'.
-        gt_dir: directory with '<db>_ground_truth_matrix.npz' (key 'matrix') and
+        gt_dir: directory with '<db>_ground_truth_matrix.npz' and
             'ground_truth_proteins.tsv' (columns idx, protein).
 
     Returns:
@@ -69,7 +150,8 @@ def load_ppi_ground_truth(db: str, gt_dir: str = GT_DIR_DEFAULT):
     """
     import pandas as pd
 
-    mat = np.load(os.path.join(gt_dir, f"{db}_ground_truth_matrix.npz"))["matrix"]
+    with np.load(os.path.join(gt_dir, f"{db}_ground_truth_matrix.npz")) as npz:
+        mat = npz["matrix"] if "matrix" in npz.files else _dense_from_sparse(npz)
     prot = pd.read_csv(os.path.join(gt_dir, "ground_truth_proteins.tsv"), sep="\t")
     proteins = prot.sort_values("idx")["protein"].tolist()
     assert mat.shape[0] == len(proteins), (mat.shape, len(proteins))
