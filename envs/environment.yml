@@ -1,8 +1,11 @@
 # Environment for running OmicsFM itself. Each experiment ships its own
 # environment file; this one covers the package only.
 #
-#     conda env create -f environment.yml
+#     conda env create -f envs/environment.yml
 #     conda activate omicsfm
+#
+# Run it from the repository root: the editable install below resolves "."
+# against the working directory, not against this file.
 #
 # Works unchanged on Windows and Linux: conda supplies only Python and pip, and
 # pip resolves platform-appropriate wheels. Dependencies come from
@@ -10,7 +13,7 @@
 # truth and no second file to drift out of sync.
 #
 # Versions float. For the exact stack a published result was produced with, see
-# environment.lock.yml.
+# envs/environment.lock.yml.
 #
 # CUDA: torch is taken from the cu128 wheel index below, matching the hardware
 # the models were trained on. Change the URL for a different CUDA version, or

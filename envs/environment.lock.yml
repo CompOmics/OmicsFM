@@ -1,6 +1,7 @@
 # Exact environment a published OmicsFM result was produced with.
-# Generated from the working environment; environment.yml is the one to use
-# day to day. Recreate with:  conda env create -f environment.lock.yml
+# Generated from the working environment; envs/environment.yml is the one to use
+# day to day. Recreate with:  conda env create -f envs/environment.lock.yml
+# Run it from the repository root.
 name: omicsfm-lock
 channels:
   - conda-forge
