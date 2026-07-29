@@ -48,8 +48,10 @@ viz = ["plotly", "umap-learn"]
 # it, visualize_sst raises "Mime type rendering requires nbformat" only at the
 # point of display, after the embedding work is already done.
 notebook = ["ipykernel", "ipywidgets", "matplotlib", "nbformat"]
-# reference/notebooks/ - rebuilding the PPI ground-truth matrices from source
-reference = ["mygene", "omnipath", "requests"]
+# reference/notebooks/ - rebuilding the ground-truth matrices and the
+# identifier crosswalk from source. pyarrow is what reads and writes
+# reference/gene_protein_map.parquet; without it pandas has no parquet engine.
+reference = ["mygene", "omnipath", "pyarrow", "requests"]
 # transcriptomics/ - building the expression datasets from primary sources.
 # Heavy (tiledbsoma, cellxgene-census), so deliberately not part of a default
 # install; only needed to regenerate the datasets rather than to use them.
