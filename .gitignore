@@ -84,11 +84,12 @@ gf-12L-30M-i2048/
 !fasta/human_proteome_canonical_31032022.fasta
 
 # Small, version-pinned reference material kept in git, as distinct from the
-# bulk datasets under data/. The blanket *.npz and *.tsv rules above would
-# otherwise hide it. Published results are pinned to these exact matrices.
+# bulk datasets under data/. The blanket *.npz, *.tsv and *.parquet rules above
+# would otherwise hide it. Published results are pinned to these exact files.
 !reference/
 !reference/*.npz
 !reference/*.tsv
+!reference/*.parquet
 
 # ── exp3.1 vendored upstream snapshots ──────────────────────────────────
 # Keep the importable packages, the licenses, and the files the README cites as
