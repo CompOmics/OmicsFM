@@ -71,6 +71,11 @@ CHECKPOINTS = {
     "bulk_transcriptomics_esmc": 111.4,
     "sc_transcriptomics":        39.0,
     "sc_transcriptomics_esmc":   111.4,
+    # Gene vocabulary rather than UniProt: 61,497 ENSEMBL features, the
+    # vocabulary of data/sc_transcriptomics_ensembl. exp3 scores it against
+    # the UniProt-vocab sc_transcriptomics to show the protein mapping is
+    # not a confound.
+    "sc_transcriptomics_ensembl": 80.4,
 }
 
 # Hub dataset name -> (repo key, {split: MB}).
