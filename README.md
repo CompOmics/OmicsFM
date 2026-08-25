@@ -11,6 +11,10 @@ Two things fall out of that:
   information moves *between* proteins, so its attention weights rank which proteins
   the model treats as related, recovering known interactions (CORUM, STRING,
   Reactome, BioPlex).
+- **Protein identity embeddings** (`visualize_proteins`) — the learned-identity
+  checkpoints assign each protein a trainable vector shaped only by expression
+  context; frozen, these embeddings predict mean gene essentiality beyond what
+  protein sequence alone provides.
 
 Six checkpoints: proteomics, bulk transcriptomics and single-cell transcriptomics,
 each with learned feature embeddings or with ESM-C protein sequence embeddings.
@@ -98,6 +102,10 @@ visible without running anything.
   passes, how averaging re-sampled passes stabilises the embedding, and the
   tissue-coloured corpus UMAP. Caches the computed SSTs so UMAP settings can be
   iterated in seconds.
+- **`protein_embeddings.ipynb`** — the learned protein identity embeddings as an
+  interactive UMAP (hover for protein and gene, coloured by corpus detection
+  frequency), and how to reuse them for downstream prediction such as gene
+  essentiality (manuscript Fig. 5D–F).
 Both run on the GPU in minutes to a couple of hours (the SST corpus pass
 is the long one and is cached afterwards); reduce `n_epochs` / `N_PASSES` on
 CPU-only machines.
