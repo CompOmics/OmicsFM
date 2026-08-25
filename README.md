@@ -5,13 +5,13 @@ transcriptomics. It is trained by masked modelling on expression bins given the
 proteins or genes detected in a sample, predict the abundance of the ones held out.
 Two things fall out of that:
 
-- **Sample embeddings** (`compute_sst`) — one vector per proteome or transcriptome,
+- **Sample embeddings** — one vector per proteome or transcriptome,
   which clusters by tissue without ever being told the tissue.
-- **Attention maps** (`attention_map`) — the transformer is the only place where
+- **Attention maps** — the transformer is the only place where
   information moves *between* proteins, so its attention weights rank which proteins
   the model treats as related, recovering known interactions (CORUM, STRING,
   Reactome, BioPlex).
-- **Protein identity embeddings** (`visualize_proteins`) — the learned-identity
+- **Protein identity embeddings** — the learned-identity
   checkpoints assign each protein a trainable vector shaped only by expression
   context; frozen, these embeddings predict mean gene essentiality beyond what
   protein sequence alone provides.

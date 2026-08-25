@@ -141,3 +141,4 @@ transcriptomics/
 
 # tutorial downloads (PRIDE files fetched by the tutorial notebooks)
 tutorials/data/
+dist/

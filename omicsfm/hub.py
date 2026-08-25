@@ -143,11 +143,22 @@ TIERS = ("models", "test", "valid", "train")
 
 
 def omicsfm_home() -> Path:
-    """Root of the local model/ and data/ tree."""
+    """Root of the local model/ and data/ tree.
+
+    Resolution order: the OMICSFM_HOME environment variable; the repository
+    root when running from a git checkout / editable install; otherwise
+    ~/.omicsfm (created on demand), so a pip-installed package never writes
+    into site-packages.
+    """
     override = os.environ.get("OMICSFM_HOME")
     if override:
         return Path(override).expanduser().resolve()
-    return Path(__file__).resolve().parents[1]
+    repo = Path(__file__).resolve().parents[1]
+    if (repo / "pyproject.toml").exists():
+        return repo
+    home = Path.home() / ".omicsfm"
+    home.mkdir(parents=True, exist_ok=True)
+    return home
 
 
 def local_path(artifact: Artifact) -> Path:
