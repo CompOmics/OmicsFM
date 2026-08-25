@@ -1,6 +1,6 @@
 # OmicsFM
 
-[![PyPI](https://img.shields.io/pypi/v/omicsfm)](https://pypi.org/project/omicsfm/)
+[![PyPI](https://img.shields.io/pypi/v/omicsfm?cacheSeconds=3600)](https://pypi.org/project/omicsfm/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 A transformer foundation model for different omics modalities: proteomics and
