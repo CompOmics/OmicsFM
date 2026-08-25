@@ -6,7 +6,7 @@
 A transformer foundation model for different omics modalities: proteomics and
 transcriptomics. It is trained by masked modelling on expression bins given the
 proteins or genes detected in a sample, predict the abundance of the ones held out.
-Two things fall out of that:
+Three things fall out of that:
 
 - **Sample embeddings** — one vector per proteome or transcriptome,
   which clusters by tissue without ever being told the tissue.
