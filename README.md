@@ -1,5 +1,8 @@
 # OmicsFM
 
+[![PyPI](https://img.shields.io/pypi/v/omicsfm)](https://pypi.org/project/omicsfm/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 A transformer foundation model for different omics modalities: proteomics and
 transcriptomics. It is trained by masked modelling on expression bins given the
 proteins or genes detected in a sample, predict the abundance of the ones held out.
