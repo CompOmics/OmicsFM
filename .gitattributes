@@ -1,0 +1,2 @@
+# Notebooks are executed tutorials/documentation - keep them out of the language statistics
+*.ipynb linguist-documentation
