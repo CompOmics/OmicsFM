@@ -31,7 +31,26 @@ pip install "omicsfm[viz]"     # + plotly / umap-learn for the visualisations
 ```
 
 Checkpoints and data download on first use into `~/.omicsfm` (override with
-`OMICSFM_HOME`). For the tutorials, the reference matrices and training, work
+`OMICSFM_HOME`). A first embedding run, end to end:
+
+```python
+from omicsfm.hub import get_checkpoint, get_dataset
+from omicsfm.api import compute_sst
+
+ckpt = get_checkpoint("proteomics")                  # ~40 MB, downloads once
+data = get_dataset("proteomics_uniprot", "test")     # 34 MB held-out samples
+
+out = compute_sst(str(ckpt), str(data), device="cpu", batch_size=32)
+print(out["sst_emb"].shape)                          # (n_samples, 256)
+```
+
+Nearest neighbours in this embedding space share tissue labels without the
+model ever seeing them. The checkpoints and the transcriptomic corpora are
+public; the proteomics corpus is gated until the manuscript is published -
+unauthenticated access fails with instructions
+(`huggingface-cli login`, or point `OMICSFM_HOME` at an existing copy).
+
+For the tutorials, the reference matrices and training, work
 from a checkout instead:
 
 Needs [git](https://git-scm.com/downloads) and
