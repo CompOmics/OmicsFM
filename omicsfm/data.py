@@ -3,8 +3,7 @@ Unified data layer for ProtGPT.
 
 Both modalities (proteomics, transcriptomics) share one on-disk **source** format —
 a `.h5ad` file with raw (unbinned) values, protein/gene accessions in `var_names`,
-and per-sample metadata in `obs` (see docs/unified_data_format_plan.md and
-protgpt/convert.py).
+and per-sample metadata in `obs` (see docs/unified_data_format_plan.md).
 
 `ExpressionDataset` reads an h5ad source and, on first use, builds a compact,
 **binned**, ragged CSR **cache** (flat `.npy` arrays) keyed by the binning/group

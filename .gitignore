@@ -138,3 +138,6 @@ tools/
 # transcriptomics corpus construction: archived to Zenodo as a self-contained
 # bundle (environment.yml + README + scripts). Not part of the code repository.
 transcriptomics/
+
+# tutorial downloads (PRIDE files fetched by the tutorial notebooks)
+tutorials/data/

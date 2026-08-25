@@ -18,7 +18,7 @@ classifiers = [
 
 # Core runtime: loading a checkpoint, running inference, extracting attention
 # and fetching artifacts. Everything imported at module level by api, attention,
-# data or convert belongs here, so `import omicsfm.api` works on a bare install.
+# data belongs here, so `import omicsfm.api` works on a bare install.
 # Versions are deliberately open; envs/environment.lock.yml records what was run.
 dependencies = [
     "anndata",

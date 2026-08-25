@@ -70,7 +70,7 @@ def train(config_path: str):
     device = torch.device(cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
     log.info(f"Device: {device}")
 
-    # data — unified .h5ad source for both modalities (see protgpt/convert.py)
+    # data — unified .h5ad source for both modalities
     pg_cfg = mcfg.get("protein_groups", {})
     pg_enabled = pg_cfg.get("enabled", False)
     abs_cfg = mcfg.get("absent_species", {})

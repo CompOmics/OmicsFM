@@ -1,7 +1,7 @@
 # OmicsFM
 
 A transformer foundation model for different omics modalities: proteomics and
-transcriptomics. It is trained by masked modelling on expression bins — given the
+transcriptomics. It is trained by masked modelling on expression bins given the
 proteins or genes detected in a sample, predict the abundance of the ones held out.
 Two things fall out of that:
 
@@ -82,11 +82,25 @@ data = get_dataset("proteomics_uniprot", "test")    #  34 MB
 
 ---
 
-## First run
+## Tutorials
 
-Open `notebooks/api.ipynb` — it loads a checkpoint, computes sample embeddings, runs
-the masked-modelling evaluation, draws a tissue-coloured UMAP and extracts an
-attention map, downloading the two files it needs as it goes.
+Start in `tutorials/`; each notebook is executed, so the expected outputs are
+visible without running anything.
+
+- **`attention_network_from_psms.ipynb`** — from a mass-spectrometry search result
+  to a protein–protein attention network: download search-engine output from PRIDE,
+  read the PSMs with [`psm_utils`](https://psm-utils.readthedocs.io), build abundance
+  profiles, extract zero-shot attention, and validate the top pairs against nine
+  interaction/pathway databases. Works with any UniProt protein set thanks to the
+  ESM-C checkpoint.
+- **`SST_embedding.ipynb`** — whole-sample (SST) embeddings on the full proteomics
+  corpus: why proteomes deeper than the 1024-protein context window need multiple
+  passes, how averaging re-sampled passes stabilises the embedding, and the
+  tissue-coloured corpus UMAP. Caches the computed SSTs so UMAP settings can be
+  iterated in seconds.
+Both run on the GPU in minutes to a couple of hours (the SST corpus pass
+is the long one and is cached afterwards); reduce `n_epochs` / `N_PASSES` on
+CPU-only machines.
 
 ## Repository layout
 
@@ -97,10 +111,9 @@ omicsfm/          the package
   data.py           ExpressionDataset: .h5ad -> binned tensors
   architecture.py   the transformer
   train.py          training loop
-  convert.py        raw tables -> .h5ad
   esmc_utils.py     ESM-C sequence embeddings
   hub.py            artifact resolution and download
-notebooks/        api.ipynb and the dataset-inspection notebooks
+tutorials/        executed tutorial notebooks (see Tutorials above)
 reference/        PPI ground-truth matrices and the notebooks that rebuild them
 config/           setup.yaml, the training configuration template
 envs/             environment.yml (float) and environment.lock.yml (exact)
@@ -126,12 +139,36 @@ rebuilds them from source, but these databases change continuously, so a rebuild
 not reproduce the published numbers — the builders refuse to overwrite an existing
 `.npz` for that reason.
 
-### Experiments and dataset construction
+### Reproducing the manuscript
 
-Not in this repository. Each experiment is a self-contained bundle on Zenodo with its
-own environment file, inputs and one command that reproduces its table or figure. The
-transcriptomics corpus-building pipeline (ARCHS4 and CELLxGENE download,
-normalisation, gene mapping, splitting) ships the same way.
+All results of the OmicsFM manuscript can be reproduced from four public resources.
+Use the first public release of this repository, **v1.0.0** — the version the
+manuscript's experiments were run with:
+
+```bash
+git clone --branch v1.0.0 https://github.com/CompOmics/OmicsFM.git
+```
+
+- **Source code** — this repository:
+  [github.com/CompOmics/OmicsFM](https://github.com/CompOmics/OmicsFM).
+- **Pretrained checkpoints** (all three modalities) — Hugging Face:
+  [rednaSander/omicsfm](https://huggingface.co/rednaSander/omicsfm).
+- **Training corpora** — bulk and single-cell transcriptomics:
+  [rednaSander/omicsfm-data](https://huggingface.co/datasets/rednaSander/omicsfm-data);
+  the reprocessed proteomics corpus will be made available in the same repository
+  upon publication.
+- **Zenodo deposits**:
+  - tissue-specific attention networks (30 human tissues, proteomics and
+    transcriptomics): [10.5281/zenodo.22069867](https://doi.org/10.5281/zenodo.22069867)
+  - dataset-construction pipelines (run-level metadata-annotation pipeline with its
+    resulting annotations, and the transcriptomics corpus builders):
+    [10.5281/zenodo.22071865](https://doi.org/10.5281/zenodo.22071865)
+  - code, inputs and outputs of all manuscript experiments — each a self-contained
+    bundle with its own README, environment and run scripts:
+    [10.5281/zenodo.22072026](https://doi.org/10.5281/zenodo.22072026)
+
+All public datasets used are referenced in Supplementary Data 1 under their
+original accessions.
 
 ## Citation
 
