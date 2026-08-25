@@ -26,8 +26,7 @@ each with learned feature embeddings or with ESM-C protein sequence embeddings.
 **Quick install** — the package is on [PyPI](https://pypi.org/project/omicsfm/):
 
 ```bash
-pip install omicsfm            # core: inference, attention, hub downloads
-pip install "omicsfm[viz]"     # + plotly / umap-learn for the visualisations
+pip install omicsfm
 ```
 
 Checkpoints and data download on first use into `~/.omicsfm` (override with

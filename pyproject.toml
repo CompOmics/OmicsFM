@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "omicsfm"
-version = "1.0.0"
+version = "1.0.1"
 description = "OmicsFM: a foundation model over paired proteomic and transcriptomic expression"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -28,10 +28,12 @@ dependencies = [
     "pandas",
     "psutil",            # omicsfm.data, memory accounting
     "pyyaml",            # module-level in omicsfm.api
+    "plotly",            # visualize_sst / visualize_proteins
     "scikit-learn",      # module-level in omicsfm.api
     "scipy",
     "torch",
     "tqdm",
+    "umap-learn",        # the default reducer for the visualisations
 ]
 
 [project.scripts]
@@ -42,8 +44,6 @@ omicsfm = "omicsfm._cli:main"
 train = ["wandb"]
 # omicsfm.esmc_utils - ESM-C protein sequence embeddings
 esmc = ["esm", "biopython"]
-# interactive plots in omicsfm.api / omicsfm.attention (imported lazily)
-viz = ["plotly", "umap-learn"]
 # running the notebooks. nbformat is required by plotly's fig.show(): without
 # it, visualize_sst raises "Mime type rendering requires nbformat" only at the
 # point of display, after the embedding work is already done.
@@ -63,7 +63,7 @@ datasets = [
     "requests",
     "tiledbsoma",
 ]
-all = ["omicsfm[train,esmc,viz,notebook,reference]"]
+all = ["omicsfm[train,esmc,notebook,reference]"]
 # Everything including the dataset-construction stack.
 full = ["omicsfm[all,datasets]"]
 
